@@ -1,0 +1,7 @@
+/numbat
+/dist/
+.DS_Store
+.claude/settings.local.json
+*.numbat/
+*.db
+coverage.out

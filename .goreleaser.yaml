@@ -1,0 +1,52 @@
+version: 2
+
+project_name: numbat
+
+builds:
+  - id: numbat
+    main: ./cmd/numbat
+    binary: numbat
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/perplexityai/numbat/internal/version.Version={{.Version}}
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: numbat
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: >-
+      numbat_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - CONTRIBUTING.md
+      - LICENSE
+      - README.md
+      - SECURITY.md
+      - THIRD_PARTY_LICENSES.txt
+      - docs/*.md
+      - docs/**/*
+      - rules/**/*.yaml
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}"
+
+release:
+  prerelease: auto
