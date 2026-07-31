@@ -34,11 +34,10 @@ const artifactCodexRollout = "codex_rollout"
 // that was rolled back. This mirrors the persistence policy in
 // codex-rs/rollout/src/policy.rs, where both layers are written to disk.
 //
-// Codex rollouts are append-only and event-ordered: unlike Gemini, the file is
-// not a mutable history that must be replayed into a canonical conversation, so
-// numbat walks it line by line like the Claude transcript parser. session_meta
-// and turn_context update the running session identity / working directory that
-// later events inherit but are not themselves emitted as events.
+// Codex rollouts are append-only and event-ordered. Forked rollouts may copy the
+// parent's history after the child session_meta; numbat skips that replay until
+// the first child task boundary. session_meta and turn_context update the
+// running identity and working directory but are not themselves emitted.
 //
 // The zero value is ready to use. maxBytes overrides the artifact size cap and
 // exists for tests; production callers use the zero value (the default cap).
@@ -56,6 +55,17 @@ func (CodexExtractor) Agent() string { return model.AgentCodex }
 type codexState struct {
 	sessionID   string
 	projectPath string
+	metaSeen    bool
+	// forkReplay suppresses copied parent records until a task_started UUID
+	// ordered after the child thread UUID marks the first child turn.
+	forkReplay    bool
+	forkSessionID [16]byte
+	// forkUnreadableLine records the first unreadable replay row so one
+	// diagnostic reports possible omission on recovery or at EOF.
+	forkUnreadableLine int
+	// forkUnorderedLine records a valid legacy task UUID. Current Codex uses
+	// ordered UUIDv7 turn IDs; a fork with only legacy IDs is ambiguous at EOF.
+	forkUnorderedLine int
 	// startIdx is the index of the synthetic session.start event in res.Events,
 	// valid only when started is set, so session.end can mirror its identity.
 	started  bool
@@ -160,7 +170,13 @@ func (e CodexExtractor) Extract(r io.Reader, src Source) (*Result, error) {
 	for line := 1; ; line++ {
 		raw, tooLong, err := readLine(br)
 		if tooLong {
-			res.diag(src.Path, line, "line exceeds size cap; skipped")
+			if st.forkReplay {
+				if st.forkUnreadableLine == 0 {
+					st.forkUnreadableLine = line
+				}
+			} else {
+				res.diag(src.Path, line, "line exceeds size cap; skipped")
+			}
 			if errors.Is(err, io.EOF) {
 				// A truncated final line still ends the stream: close the session
 				// so a capped rollout is not left with a start and no end.
@@ -190,6 +206,11 @@ func (e CodexExtractor) Extract(r io.Reader, src Source) (*Result, error) {
 // closing record to point a JSONPointer at, so the end carries artifact-level
 // evidence (path/line/hash) with an empty pointer.
 func (e CodexExtractor) emitSessionEnd(res *Result, src Source, sha string, st *codexState) {
+	if st.forkReplay && st.forkUnreadableLine > 0 {
+		res.diag(src.Path, st.forkUnreadableLine, "fork replay ended without a valid child task boundary after an unreadable record; child activity may be omitted")
+	} else if st.forkReplay && st.forkUnorderedLine > 0 {
+		res.diag(src.Path, st.forkUnorderedLine, "fork replay ended without an orderable child task boundary; child activity may be omitted")
+	}
 	if !st.started {
 		return
 	}
@@ -213,8 +234,37 @@ func (e CodexExtractor) emitSessionEnd(res *Result, src Source, sha string, st *
 func (e CodexExtractor) mapLine(res *Result, src Source, sha string, st *codexState, line int, raw []byte) {
 	var rl codexLine
 	if err := json.Unmarshal(raw, &rl); err != nil {
-		res.diag(src.Path, line, "malformed JSON line")
+		if st.forkReplay {
+			if st.forkUnreadableLine == 0 {
+				st.forkUnreadableLine = line
+			}
+		} else {
+			res.diag(src.Path, line, "malformed JSON line")
+		}
 		return
+	}
+	if st.forkReplay {
+		switch codexForkReplayBoundary(rl, st.forkSessionID) {
+		case codexForkBoundaryUnreadable:
+			if st.forkUnreadableLine == 0 {
+				st.forkUnreadableLine = line
+			}
+			return
+		case codexForkBoundaryUnordered:
+			if st.forkUnorderedLine == 0 {
+				st.forkUnorderedLine = line
+			}
+			return
+		case codexForkBoundaryChild:
+			// Continue below so the boundary line still updates parser state.
+		default:
+			return
+		}
+		if st.forkUnreadableLine > 0 {
+			res.diag(src.Path, st.forkUnreadableLine, "unreadable record while excluding copied fork history; activity before the child task boundary may be omitted")
+			st.forkUnreadableLine = 0
+		}
+		st.forkReplay = false
 	}
 	if rl.Timestamp != "" {
 		st.lastTimestamp = rl.Timestamp
@@ -251,11 +301,21 @@ func (e CodexExtractor) applySessionMeta(res *Result, src Source, sha string, st
 		res.diag(src.Path, line, "malformed session_meta payload")
 		return
 	}
+	firstMeta := !st.metaSeen
+	st.metaSeen = true
 	if st.sessionID == "" {
 		st.sessionID = meta.ID
 	}
 	if st.projectPath == "" {
 		st.projectPath = meta.Cwd
+	}
+	if firstMeta && meta.ForkedFromID != "" {
+		if id, ok := codexUUIDv7(meta.ID); ok {
+			st.forkReplay = true
+			st.forkSessionID = id
+		} else {
+			res.diag(src.Path, line, "forked session id is not UUIDv7; replay filtering disabled")
+		}
 	}
 	if st.started {
 		return
@@ -278,6 +338,39 @@ func (e CodexExtractor) applySessionMeta(res *Result, src Source, sha string, st
 	st.startIdx = len(res.Events)
 	st.started = true
 	res.Events = append(res.Events, ev)
+}
+
+type codexForkBoundary uint8
+
+const (
+	codexForkBoundaryNone codexForkBoundary = iota
+	codexForkBoundaryChild
+	codexForkBoundaryUnreadable
+	codexForkBoundaryUnordered
+)
+
+func codexForkReplayBoundary(line codexLine, sessionID [16]byte) codexForkBoundary {
+	if line.Type != codexTypeEventMsg {
+		return codexForkBoundaryNone
+	}
+	var event codexEventMsg
+	if json.Unmarshal(line.Payload, &event) != nil {
+		return codexForkBoundaryUnreadable
+	}
+	if event.Type != codexEMTaskStarted {
+		return codexForkBoundaryNone
+	}
+	turnID, ok := codexUUIDv7(event.TurnID)
+	if !ok {
+		if _, valid := codexUUID(event.TurnID); valid {
+			return codexForkBoundaryUnordered
+		}
+		return codexForkBoundaryUnreadable
+	}
+	if bytes.Compare(turnID[:], sessionID[:]) > 0 {
+		return codexForkBoundaryChild
+	}
+	return codexForkBoundaryNone
 }
 
 // applyTurnContext refreshes the working directory from a turn_context line.

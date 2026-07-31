@@ -1288,3 +1288,147 @@ func TestExtractCodexFirstSessionMetaWins(t *testing.T) {
 		t.Errorf("session_id = %q, want first (the first session_meta is canonical)", acts[0].SessionID)
 	}
 }
+
+func TestExtractCodexForkSkipsCopiedHistory(t *testing.T) {
+	const childID = "019f84fe-e5e1-7f80-8745-493ccff96186"
+	body := strings.Join([]string{
+		`{"timestamp":"t1","type":"session_meta","payload":{"id":"` + childID + `","forked_from_id":"019f620e-730d-76e2-8204-f108cfe2f082","cwd":"/child"}}`,
+		`{"timestamp":"t2","type":"turn_context","payload":{"cwd":"/parent"}}`,
+		`not json`,
+		`{"timestamp":"t4","type":"event_msg","payload":{"type":"task_started","turn_id":"019f84f6-8114-7cd3-8ac7-47ad22f4fba9"}}`,
+		`{"timestamp":"t5","type":"response_item","payload":{"type":"message","role":"user","content":"parent prompt"}}`,
+		`{"timestamp":"t6","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"parent","arguments":"{\"command\":\"echo parent\"}"}}`,
+		`{"timestamp":"t7","type":"event_msg","payload":{"type":"task_started","turn_id":"` + childID + `"}}`,
+		`{"timestamp":"t8","type":"response_item","payload":{"type":"message","role":"assistant","content":"parent answer"}}`,
+		`{"timestamp":"t9","type":"event_msg","payload":{"type":"task_started","turn_id":"019f84ff-90e1-7f12-9b81-ed81048178c1"}}`,
+		`{"timestamp":"t10","type":"turn_context","payload":{"cwd":"/child/live"}}`,
+		`{"timestamp":"t11","type":"response_item","payload":{"type":"message","role":"user","content":"child prompt"}}`,
+		`{"timestamp":"t12","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"child","arguments":"{\"command\":\"echo child\"}"}}`,
+		`{"timestamp":"t13","type":"response_item","payload":{"type":"function_call_output","call_id":"child","output":"done"}}`,
+	}, "\n")
+	res := extractCodex(t, body)
+	acts := activityEvents(res.Events)
+	if len(acts) != 3 {
+		t.Fatalf("got %d activity events, want child prompt/command/result: %s", len(acts), dumpEvents(acts))
+	}
+	if acts[0].EventType != model.EventPromptUser || acts[0].ContentPreview != "child prompt" ||
+		acts[1].EventType != model.EventCommandExec || acts[1].Command != "echo child" ||
+		acts[2].EventType != model.EventCommandResult {
+		t.Fatalf("events = %s, copied parent activity was not excluded", dumpEvents(acts))
+	}
+	for _, ev := range acts {
+		if ev.SessionID != childID || ev.ProjectPath != "/child/live" {
+			t.Errorf("child event identity = session %q path %q", ev.SessionID, ev.ProjectPath)
+		}
+	}
+	if acts[0].Evidence.Line != 11 {
+		t.Errorf("first child event line = %d, want 11", acts[0].Evidence.Line)
+	}
+	if len(res.Diagnostics) != 1 || !strings.Contains(res.Diagnostics[0].Msg, "may be omitted") {
+		t.Errorf("diagnostics = %+v, want one bounded uncertainty warning", res.Diagnostics)
+	}
+}
+
+func TestExtractCodexForkWithoutChildTurnEmitsOnlyLifecycle(t *testing.T) {
+	body := strings.Join([]string{
+		`{"timestamp":"t1","type":"session_meta","payload":{"id":"019f84fe-e5e1-7f80-8745-493ccff96186","forked_from_id":"019f620e-730d-76e2-8204-f108cfe2f082","cwd":"/child"}}`,
+		`{"timestamp":"t2","type":"event_msg","payload":{"type":"task_started","turn_id":"019f84f6-8114-7cd3-8ac7-47ad22f4fba9"}}`,
+		`{"timestamp":"t3","type":"event_msg","payload":{"type":"task_started","turn_id":"ffffffff-ffff-4fff-bfff-ffffffffffff"}}`,
+		`{"timestamp":"t4","type":"response_item","payload":{"type":"message","role":"user","content":"copied"}}`,
+	}, "\n")
+	res := extractCodex(t, body)
+	if acts := activityEvents(res.Events); len(acts) != 0 {
+		t.Fatalf("copied history emitted activity: %s", dumpEvents(acts))
+	}
+	if len(res.Events) != 2 || res.Events[0].EventType != model.EventSessionStart ||
+		res.Events[1].EventType != model.EventSessionEnd || res.Events[1].Evidence.Line != 1 {
+		t.Fatalf("events = %s, want lifecycle bounded by child session_meta", dumpEvents(res.Events))
+	}
+	if len(res.Diagnostics) != 1 || !strings.Contains(res.Diagnostics[0].Msg, "orderable child task boundary") {
+		t.Errorf("diagnostics = %+v, want one legacy-boundary uncertainty warning", res.Diagnostics)
+	}
+}
+
+func TestExtractCodexForkIgnoresCopiedLegacyTaskID(t *testing.T) {
+	body := strings.Join([]string{
+		`{"timestamp":"t1","type":"session_meta","payload":{"id":"019f84fe-e5e1-7f80-8745-493ccff96186","forked_from_id":"019f620e-730d-76e2-8204-f108cfe2f082","cwd":"/child"}}`,
+		`{"timestamp":"t2","type":"event_msg","payload":{"type":"task_started","turn_id":"ffffffff-ffff-4fff-bfff-ffffffffffff"}}`,
+		`{"timestamp":"t3","type":"event_msg","payload":{"type":"task_started","turn_id":"019f84f6-8114-7cd3-8ac7-47ad22f4fba9"}}`,
+		`{"timestamp":"t4","type":"response_item","payload":{"type":"message","role":"user","content":"copied"}}`,
+		`{"timestamp":"t5","type":"event_msg","payload":{"type":"task_started","turn_id":"019f84ff-90e1-7f12-9b81-ed81048178c1"}}`,
+		`{"timestamp":"t6","type":"response_item","payload":{"type":"message","role":"user","content":"child"}}`,
+	}, "\n")
+	res := extractCodex(t, body)
+	acts := activityEvents(res.Events)
+	if len(acts) != 1 || acts[0].ContentPreview != "child" {
+		t.Fatalf("events = %s, copied legacy turn was not excluded", dumpEvents(acts))
+	}
+	if len(res.Diagnostics) != 0 {
+		t.Fatalf("copied legacy task ID produced diagnostics after an ordered child boundary: %+v", res.Diagnostics)
+	}
+}
+
+func TestExtractCodexForkWithLegacyIDFailsOpen(t *testing.T) {
+	body := strings.Join([]string{
+		`{"timestamp":"t1","type":"session_meta","payload":{"id":"legacy-child","forked_from_id":"legacy-parent","cwd":"/child"}}`,
+		`{"timestamp":"t2","type":"response_item","payload":{"type":"message","role":"user","content":"visible"}}`,
+	}, "\n")
+	res := extractCodex(t, body)
+	acts := activityEvents(res.Events)
+	if len(acts) != 1 || acts[0].ContentPreview != "visible" {
+		t.Fatalf("legacy fork did not fail open: %s", dumpEvents(acts))
+	}
+	if len(res.Diagnostics) != 1 || !strings.Contains(res.Diagnostics[0].Msg, "replay filtering disabled") {
+		t.Fatalf("diagnostics = %+v, want one replay-filter warning", res.Diagnostics)
+	}
+}
+
+func TestExtractCodexForkUnreadableBoundaryWarns(t *testing.T) {
+	const meta = `{"timestamp":"t1","type":"session_meta","payload":{"id":"019f84fe-e5e1-7f80-8745-493ccff96186","forked_from_id":"019f620e-730d-76e2-8204-f108cfe2f082","cwd":"/child"}}`
+	const boundary = `{"timestamp":"t3","type":"event_msg","payload":{"type":"task_started","turn_id":"019f84ff-90e1-7f12-9b81-ed81048178c1"}}`
+	for _, tc := range []struct {
+		name string
+		row  string
+	}{
+		{name: "malformed", row: `{"type":"event_msg","payload":{"type":"task_started"`},
+		{name: "missing turn id", row: `{"type":"event_msg","payload":{"type":"task_started"}}`},
+		{name: "unrecognized UUID version", row: `{"type":"event_msg","payload":{"type":"task_started","turn_id":"ffffffff-ffff-ffff-bfff-ffffffffffff"}}`},
+		{name: "overlong", row: strings.Repeat("x", maxLineSize+1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := strings.Join([]string{
+				meta,
+				tc.row,
+				boundary,
+				`{"timestamp":"t4","type":"response_item","payload":{"type":"message","role":"user","content":"child"}}`,
+			}, "\n")
+			res, err := CodexExtractor{maxBytes: len(body) + 1}.Extract(strings.NewReader(body), Source{Path: "/cases/fork.jsonl"})
+			if err != nil {
+				t.Fatalf("Extract returned error: %v", err)
+			}
+			acts := activityEvents(res.Events)
+			if len(acts) != 1 || acts[0].ContentPreview != "child" {
+				t.Fatalf("activity after the recovered boundary = %s", dumpEvents(acts))
+			}
+			if len(res.Diagnostics) != 1 || !strings.Contains(res.Diagnostics[0].Msg, "may be omitted") {
+				t.Fatalf("diagnostics = %+v, want one bounded omission warning", res.Diagnostics)
+			}
+		})
+	}
+
+	body := strings.Join([]string{
+		meta,
+		`{"type":"event_msg","payload":{"type":"task_started"}}`,
+		`{"timestamp":"t3","type":"response_item","payload":{"type":"message","role":"user","content":"unproven"}}`,
+	}, "\n")
+	res, err := CodexExtractor{maxBytes: len(body) + 1}.Extract(strings.NewReader(body), Source{Path: "/cases/fork.jsonl"})
+	if err != nil {
+		t.Fatalf("Extract returned error: %v", err)
+	}
+	if acts := activityEvents(res.Events); len(acts) != 0 {
+		t.Fatalf("activity after an unproven boundary was emitted: %s", dumpEvents(acts))
+	}
+	if len(res.Diagnostics) != 1 || !strings.Contains(res.Diagnostics[0].Msg, "child activity may be omitted") {
+		t.Fatalf("EOF diagnostics = %+v, want one bounded omission warning", res.Diagnostics)
+	}
+}

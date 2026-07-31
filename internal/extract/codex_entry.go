@@ -46,16 +46,15 @@ const (
 	codexRIContextCompaction = "context_compaction"
 )
 
-// Codex event_msg inner payload types numbat surfaces. The conversation and
-// tool timeline is taken from the response_item layer (the Responses API
-// ground truth); from event_msg numbat emits only records that have no
-// response_item equivalent and carry distinct forensic signal: a turn that was
-// aborted, and history that was rolled back. Everything else in event_msg
-// (user_message/agent_message/patch_apply_end/...) duplicates a response_item
-// record and is intentionally skipped to avoid double-counting the timeline.
+// Codex event_msg inner payload types numbat interprets. The conversation and
+// tool timeline comes from response_item; event_msg contributes only distinct
+// state changes, structured MCP failure, and the task boundary used to exclude
+// copied history from forked rollouts.
 const (
 	codexEMTurnAborted      = "turn_aborted"
 	codexEMThreadRolledBack = "thread_rolled_back"
+	// task_started is a fork replay boundary, not an emitted timeline event.
+	codexEMTaskStarted = "task_started"
 	// Persisted event_msg lifecycle/state transitions with NO response_item
 	// twin (verified against policy.rs should_persist_event_msg). Unlike
 	// user_message/agent_message/patch_apply_end — which duplicate a
@@ -107,15 +106,42 @@ type codexLine struct {
 	Payload   json.RawMessage `json:"payload"`
 }
 
-// codexSessionMeta is the first-line metadata: thread id, working directory,
-// and (flattened) git info. Only the fields numbat maps are decoded.
+// codexSessionMeta is the first-line metadata: thread identity, fork lineage,
+// working directory, and runtime details. Only fields numbat uses are decoded.
 type codexSessionMeta struct {
 	ID            string `json:"id"`
+	ForkedFromID  string `json:"forked_from_id"`
 	Timestamp     string `json:"timestamp"`
 	Cwd           string `json:"cwd"`
 	Originator    string `json:"originator"`
 	CliVersion    string `json:"cli_version"`
 	ModelProvider string `json:"model_provider"`
+}
+
+func codexUUID(id string) ([16]byte, bool) {
+	var uuid [16]byte
+	if len(id) != 36 || id[8] != '-' || id[13] != '-' || id[18] != '-' || id[23] != '-' {
+		return uuid, false
+	}
+	compact := id[:8] + id[9:13] + id[14:18] + id[19:23] + id[24:]
+	decoded, err := hex.DecodeString(compact)
+	if err != nil || len(decoded) != len(uuid) {
+		return uuid, false
+	}
+	copy(uuid[:], decoded)
+	version := uuid[6] >> 4
+	if uuid[8]&0xc0 != 0x80 || version == 0 || version > 8 {
+		return [16]byte{}, false
+	}
+	return uuid, true
+}
+
+func codexUUIDv7(id string) ([16]byte, bool) {
+	uuid, ok := codexUUID(id)
+	if !ok || uuid[6]>>4 != 7 {
+		return [16]byte{}, false
+	}
+	return uuid, true
 }
 
 // codexTurnContext carries the per-turn working directory. One turn_context is
