@@ -2666,15 +2666,10 @@ func promptWithAttachments(prompt string, paths []string) string {
 }
 
 // previewMax bounds a retained excerpt, in runes, matching the extractor.
-const previewMax = 200
+const previewMax = model.ContentPreviewMaxRunes
 
-// preview returns a single-line, rune-bounded excerpt of s.
 func preview(s string) string {
-	s = strings.Join(strings.Fields(s), " ")
-	if len([]rune(s)) <= previewMax {
-		return s
-	}
-	return string([]rune(s)[:previewMax])
+	return model.NormalizeContentPreview(s)
 }
 
 // mcpFetchToolName and the mcp__ split mirror the extractor's shared constants;

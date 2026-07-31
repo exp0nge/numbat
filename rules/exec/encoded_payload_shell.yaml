@@ -1,11 +1,11 @@
 id: exec.encoded_payload_shell
-version: "1.3"
+version: "1.4"
 enabled: true
 title: Encoded payload decoded into a shell
 description: |-
   A command decoded base64 content and piped the result into a shell form that executes
-  standard input. Supplying a separate local script to the shell is excluded because the
-  decoded bytes are not what executes.
+  standard input. Supplying a local script or overriding the shell's standard input is
+  excluded because the decoded bytes are not what executes.
 severity: high
 expr: |-
   (event.event_type == "command.exec" || (event.source_type == "otel" && event.event_type == "command.result")) &&
@@ -14,8 +14,12 @@ expr: |-
     decoder.argv.exists(arg, arg in ["-d", "-D", "--decode"]) &&
     decoder.pipeline_id > 0 &&
     shell_commands.exists(interpreter,
-      interpreter.statement_id != decoder.statement_id &&
+      decoder.statement_id < interpreter.statement_id &&
       interpreter.pipeline_id == decoder.pipeline_id &&
+      !interpreter.redirects.exists(redirect,
+        redirect.fd == 0 &&
+        !(redirect.op == "duplicate" && redirect.target.matches("^0+$"))
+      ) &&
       interpreter.name in ["sh", "bash", "zsh", "dash", "ksh"] &&
       !interpreter.argv.slice(1, interpreter.argv.size()).exists(arg, arg.matches("^-[^-]*c")) &&
       (

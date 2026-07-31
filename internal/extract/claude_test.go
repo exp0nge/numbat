@@ -300,15 +300,15 @@ func TestExtractClaudeContentEdgeCases(t *testing.T) {
 	}
 }
 
-func TestExtractClaudeContentPreviewBounded(t *testing.T) {
+func TestExtractClaudeContentPreviewDropsOverlongToken(t *testing.T) {
 	long := strings.Repeat("a", previewMax+50)
 	res := extractFixture(t, `{"type":"user","uuid":"u","message":{"role":"user","content":"`+long+`"}}`)
 	if len(res.Events) != 1 {
 		t.Fatalf("got %d events, want 1", len(res.Events))
 	}
 	got := res.Events[0].ContentPreview
-	if n := utf8.RuneCountInString(got); n != previewMax {
-		t.Errorf("preview rune count = %d, want %d", n, previewMax)
+	if got != "" {
+		t.Errorf("preview = %q, want empty rather than a partial token", got)
 	}
 }
 
@@ -316,8 +316,9 @@ func TestExtractClaudeContentPreviewBounded(t *testing.T) {
 // UTF-8; a byte-slice truncation would split a multibyte rune and corrupt the
 // SHA-anchored evidence story.
 func TestExtractClaudeContentPreviewMultibyte(t *testing.T) {
-	// "世" is a 3-byte rune; previewMax+10 of them overshoot the rune cap.
-	long := strings.Repeat("世", previewMax+10)
+	// Repeated multibyte words overshoot the cap but still leave safe token
+	// boundaries before it.
+	long := strings.Repeat("世 ", previewMax+10)
 	res := extractFixture(t, `{"type":"user","uuid":"u","message":{"role":"user","content":"`+long+`"}}`)
 	if len(res.Events) != 1 {
 		t.Fatalf("got %d events, want 1", len(res.Events))
@@ -326,8 +327,15 @@ func TestExtractClaudeContentPreviewMultibyte(t *testing.T) {
 	if !utf8.ValidString(got) {
 		t.Errorf("preview is not valid UTF-8: %q", got)
 	}
-	if n := utf8.RuneCountInString(got); n != previewMax {
-		t.Errorf("preview rune count = %d, want %d", n, previewMax)
+	if n := utf8.RuneCountInString(got); n > previewMax || !strings.HasSuffix(got, "世") {
+		t.Errorf("preview = %q (%d runes), want complete multibyte words within the cap", got, n)
+	}
+}
+
+func TestExtractPreviewDoesNotFabricatePartialDomain(t *testing.T) {
+	input := "prefix https://" + strings.Repeat("a", previewMax) + ".example"
+	if got := preview(input); got != "prefix" {
+		t.Fatalf("preview = %q, want prefix without a partial domain", got)
 	}
 }
 

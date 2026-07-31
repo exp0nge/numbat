@@ -10,6 +10,13 @@ import (
 	"github.com/perplexityai/numbat/internal/model"
 )
 
+func TestPreviewDoesNotCutToken(t *testing.T) {
+	input := "prefix " + strings.Repeat("x", previewMax+1)
+	if got := preview(input); got != "prefix" {
+		t.Fatalf("preview = %q, want complete prefix token", got)
+	}
+}
+
 // --- minimal OTLP protobuf builders (test-only) ---------------------------
 //
 // These mirror the wire shapes wire.go decodes, so the mapper tests exercise

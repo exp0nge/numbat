@@ -102,8 +102,7 @@ func TestMapOpenClawConversationBoundaries(t *testing.T) {
 		"boundary":       "model",
 	})
 	if modelOutput.EventType != model.EventMessageAssistant || modelOutput.Actor != model.ActorAssistant ||
-		len([]rune(modelOutput.ContentPreview)) != previewMax ||
-		!strings.HasPrefix(modelOutput.ContentPreview, "first second ") ||
+		modelOutput.ContentPreview != "first second" ||
 		!containsString(modelOutput.Tags, openClawTagModelBoundary) {
 		t.Fatalf("model output mapping = %+v", modelOutput)
 	}

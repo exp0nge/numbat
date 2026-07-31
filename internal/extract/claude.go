@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/perplexityai/numbat/internal/model"
 )
@@ -722,21 +721,8 @@ func classifyTool(ev *model.Event, name string, input map[string]json.RawMessage
 // previewMax bounds a retained content excerpt, in runes. Previews are
 // convenience context for a reviewer, never a place to stash raw content;
 // redaction on emission is the real guard.
-const previewMax = 200
+const previewMax = model.ContentPreviewMaxRunes
 
-// preview returns a single-line, rune-bounded excerpt of s. It truncates on a
-// rune boundary so ContentPreview is always valid UTF-8.
 func preview(s string) string {
-	s = strings.Join(strings.Fields(s), " ")
-	if utf8.RuneCountInString(s) <= previewMax {
-		return s
-	}
-	n := 0
-	for i := range s {
-		if n == previewMax {
-			return s[:i]
-		}
-		n++
-	}
-	return s
+	return model.NormalizeContentPreview(s)
 }

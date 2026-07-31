@@ -610,14 +610,10 @@ func firstNonEmpty(vals ...string) string {
 }
 
 // previewMax bounds a retained excerpt, in runes, matching the hook/extractor.
-const previewMax = 200
+const previewMax = model.ContentPreviewMaxRunes
 
 func preview(s string) string {
-	s = strings.Join(strings.Fields(s), " ")
-	if len([]rune(s)) <= previewMax {
-		return s
-	}
-	return string([]rune(s)[:previewMax])
+	return model.NormalizeContentPreview(s)
 }
 
 // otelNetworkTargetURL returns raw iff it parses as an absolute http:// or
