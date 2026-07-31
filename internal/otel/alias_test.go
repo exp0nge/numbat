@@ -394,6 +394,19 @@ func TestGeminiAliases(t *testing.T) {
 		mustValidate(t, ev)
 	})
 
+	t.Run("tool_call_file_write_without_logged_args", func(t *testing.T) {
+		rec := recBuilder{attrs: [][]byte{
+			eventNameAttr(geminiToolCall),
+			kv(attrFunctionName, "write_file"),
+			kvAny(attrSuccess, anyBool(true)),
+		}}.build()
+		ev := mustMap(t, resource, rec)
+		if ev.EventType != model.EventFileWrite || ev.FilePath != "" {
+			t.Fatalf("file tool without arguments = %+v", ev)
+		}
+		mustValidate(t, ev)
+	})
+
 	t.Run("api response", func(t *testing.T) {
 		rec := recBuilder{attrs: [][]byte{
 			eventNameAttr(geminiAPIResponse),
@@ -451,74 +464,66 @@ func TestGeminiAliases(t *testing.T) {
 		}
 	})
 
-	t.Run("file_operation_read", func(t *testing.T) {
-		// A NEUTRAL tool_name (no read/view token) so the direction can only come
-		// from the bare "operation" attribute, not classifyFile's name heuristic.
+	t.Run("file_operation_skips", func(t *testing.T) {
 		rec := recBuilder{attrs: [][]byte{
 			eventNameAttr(geminiFileOperation),
-			kv(attrAliasToolName, "fs_tool"),
-			kv(attrOperation, "read"),
-			kv(attrFilePathAlt, "/etc/shadow"),
+			kv(attrAliasToolName, "write_file"),
+			kv("operation", "create"),
+			kv(attrGenAIToolName, "write_file"),
+			kv(attrFilePath, "/tmp/coincidental.txt"),
 		}}.build()
-		ev := mustMap(t, resource, rec)
-		if ev.EventType != model.EventFileRead {
-			t.Errorf("event_type = %q, want file.read from operation alone", ev.EventType)
+		if res := mapOne(t, resource, rec); res.Mapped || !res.Ignored {
+			t.Fatalf("supplemental file operation result = %+v", res)
 		}
-		if ev.FilePath != "/etc/shadow" {
-			t.Errorf("file_path = %q", ev.FilePath)
-		}
-		mustValidate(t, ev)
 	})
+}
 
-	t.Run("file_operation_write", func(t *testing.T) {
-		// Neutral tool_name again: only operation="create" should drive file.write.
-		// If the operation attribute were ignored, this neutral name would default
-		// to file.read and the test would fail.
-		rec := recBuilder{attrs: [][]byte{
-			eventNameAttr(geminiFileOperation),
-			kv(attrAliasToolName, "fs_tool"),
-			kv(attrOperation, "create"),
-			kv(attrPathAlt, "/tmp/backdoor.sh"),
-		}}.build()
-		ev := mustMap(t, resource, rec)
-		if ev.EventType != model.EventFileWrite {
-			t.Errorf("event_type = %q, want file.write from operation alone", ev.EventType)
-		}
-		if ev.FilePath != "/tmp/backdoor.sh" {
-			t.Errorf("file_path = %q", ev.FilePath)
-		}
-		mustValidate(t, ev)
-	})
+func TestGeminiQwenFileOperationDoesNotDuplicateToolCall(t *testing.T) {
+	tests := []struct {
+		name         string
+		service      string
+		toolEvent    string
+		fileEvent    string
+		functionName string
+		functionArgs string
+		wantAgent    string
+	}{
+		{"gemini", "gemini-cli", geminiToolCall, geminiFileOperation, "write_file", `{"file_path":"/tmp/gemini.txt"}`, model.AgentGeminiCLI},
+		{"qwen", "qwen-code", qwenToolCall, qwenFileOperation, "WriteFile", `{"file_path":"/tmp/qwen.txt"}`, model.AgentQwenCode},
+	}
 
-	t.Run("file_operation_path_from_function_args", func(t *testing.T) {
-		// No top-level path attribute: the file path must be recovered from the
-		// function_args JSON object's file_path field.
-		rec := recBuilder{attrs: [][]byte{
-			eventNameAttr(geminiFileOperation),
-			kv(attrAliasToolName, "fs_tool"),
-			kv(attrOperation, "update"),
-			kv(attrFunctionArgs, `{"file_path":"/tmp/payload.sh","content":"x"}`),
-		}}.build()
-		ev := mustMap(t, resource, rec)
-		if ev.EventType != model.EventFileWrite {
-			t.Errorf("event_type = %q, want file.write", ev.EventType)
-		}
-		if ev.FilePath != "/tmp/payload.sh" {
-			t.Errorf("file_path = %q, want it recovered from function_args", ev.FilePath)
-		}
-		mustValidate(t, ev)
-	})
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ids := []string{"ev-tool", "ev-file"}
+			toolCall := recBuilder{attrs: [][]byte{
+				eventNameAttr(tc.toolEvent),
+				kv(attrFunctionName, tc.functionName),
+				kv(attrFunctionArgs, tc.functionArgs),
+				kvAny(attrSuccess, anyBool(true)),
+			}}.build()
+			fileOperation := recBuilder{attrs: [][]byte{
+				eventNameAttr(tc.fileEvent),
+				kv(attrAliasToolName, tc.functionName),
+				kv("operation", "create"),
+			}}.build()
 
-	t.Run("file_operation_unknown_skips", func(t *testing.T) {
-		rec := recBuilder{attrs: [][]byte{
-			eventNameAttr(geminiFileOperation),
-			kv(attrAliasToolName, "fs_tool"),
-			kv(attrOperation, "future_operation"),
-		}}.build()
-		if res := mapOne(t, resource, rec); res.Mapped {
-			t.Fatalf("unknown file operation mapped as %q", res.Event.EventType)
-		}
-	})
+			results, err := MapRecords(
+				exportRequest([][]byte{kv(attrServiceName, tc.service)}, toolCall, fileOperation),
+				func(i int) string { return ids[i] },
+			)
+			if err != nil {
+				t.Fatalf("MapRecords: %v", err)
+			}
+			if len(results) != 2 || !results[0].Mapped || results[1].Mapped || !results[1].Ignored {
+				t.Fatalf("map results = %+v", results)
+			}
+			ev := results[0].Event
+			if ev.EventType != model.EventFileWrite || ev.SourceAgent != tc.wantAgent || ev.FilePath == "" {
+				t.Fatalf("canonical file event = %+v", ev)
+			}
+			mustValidate(t, ev)
+		})
+	}
 }
 
 func TestQwenAliases(t *testing.T) {

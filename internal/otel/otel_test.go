@@ -488,6 +488,21 @@ func TestMapNetworkIndicator(t *testing.T) {
 	}
 }
 
+func TestMapFailedNetworkIndicatorTagged(t *testing.T) {
+	rec := recBuilder{attrs: [][]byte{
+		kv(attrServiceName, "claude-code"),
+		kv(attrGenAIToolName, "WebFetch"),
+		kv(attrURLFull, "https://example.com/data"),
+		kv("error.type", "timeout"),
+	}}.build()
+	ev := mapOne(t, nil, rec).Event
+	if ev.EventType != model.EventNetworkIndicator || len(ev.Tags) != 2 ||
+		!hasTag(ev, model.TagNetwork) || !hasTag(ev, model.TagToolError) {
+		t.Fatalf("failed network event = %+v", ev)
+	}
+	mustValidate(t, ev)
+}
+
 // Regression: a url.full that is not an absolute http(s) URL with a
 // host must NOT be promoted into Event.URL. file:///etc/passwd leaves URL empty
 // (kept in ContentPreview); the event is still a network.indicator tagged network.

@@ -365,6 +365,9 @@ func (c *collector) handleLogs(w http.ResponseWriter, r *http.Request) {
 	rejected := int64(0)
 	noAnalog := 0
 	for _, res := range results {
+		if res.Ignored {
+			continue
+		}
 		if !res.Mapped {
 			c.skippedN.Add(1)
 			rejected++

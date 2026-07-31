@@ -98,15 +98,15 @@ const (
 	attrEventTimestamp      = "event.timestamp"
 )
 
-// MapResult is the outcome of mapping one OTLP record. Mapped is true when the
-// record classified onto an existing event_type; when false the record had no
-// analog in numbat's vocabulary and the caller skips it (see Map). Event is
-// meaningful only when Mapped is true.
+// MapResult is the outcome of mapping one OTLP record. Mapped identifies a
+// normalized event; Ignored identifies known supplemental telemetry that must
+// not count as a rejected record. Event is meaningful only when Mapped is true.
 type MapResult struct {
-	Event  model.Event
-	Mapped bool
+	Event   model.Event
+	Mapped  bool
+	Ignored bool
 	// SourceAgent is the agent the record's service.name resolved to, returned
-	// even for a skipped record so the caller can label a skip diagnostic.
+	// even for a skipped or ignored record.
 	SourceAgent string
 }
 
@@ -189,6 +189,10 @@ func serviceName(a attrs) string {
 func mapRecord(resourceAttrs []keyValue, rec logRecord, eventID string) MapResult {
 	a := newAttrs(resourceAttrs, rec.attributes)
 	sourceAgent := serviceName(a)
+	name := eventName(&a, rec)
+	if name == geminiFileOperation || name == qwenFileOperation {
+		return MapResult{Ignored: true, SourceAgent: sourceAgent}
+	}
 
 	ev := model.Event{
 		SchemaVersion: model.SchemaVersion,
@@ -342,6 +346,9 @@ func classifyTool(ev *model.Event, a *attrs, rec logRecord) {
 		ev.Tags = append(ev.Tags, model.TagNetwork)
 		if server, tool, ok := splitMCPName(name); ok {
 			ev.MCPServer, ev.MCPTool = server, tool
+		}
+		if errored(a, rec) {
+			ev.Tags = append(ev.Tags, model.TagToolError)
 		}
 		return
 	}

@@ -297,6 +297,55 @@ func TestCollectHandlerSkipsNoAnalog(t *testing.T) {
 	}
 }
 
+func TestCollectHandlerSilentlyIgnoresSupplementalFileOperation(t *testing.T) {
+	var records, diags bytes.Buffer
+	c := newTestCollector(t, &records, &diags, emitSelection{events: true})
+
+	body := buildOTLPLogs("gemini-cli", []map[string]string{
+		{
+			"__event_name":  "gemini_cli.tool_call",
+			"function_name": "write_file",
+			"function_args": `{"file_path":"/tmp/agent.txt"}`,
+			"success":       "true",
+		},
+		{
+			"__event_name": "gemini_cli.file_operation",
+			"tool_name":    "write_file",
+			"operation":    "create",
+		},
+	})
+	rr := postLogs(t, c, body, contentTypeProtobuf)
+	if rr.Code != http.StatusOK || rr.Body.Len() != 0 {
+		t.Fatalf("response = %d %x, want empty 200", rr.Code, rr.Body.Bytes())
+	}
+	if diags.Len() != 0 {
+		t.Fatalf("unexpected diagnostics: %s", diags.String())
+	}
+	if c.processed() != 1 || c.skipped() != 0 {
+		t.Fatalf("processed/skipped = %d/%d, want 1/0", c.processed(), c.skipped())
+	}
+
+	var events int
+	for _, line := range strings.Split(strings.TrimSpace(records.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("bad record JSON: %v", err)
+		}
+		if rec["record_type"] == output.RecordEvent {
+			events++
+			if rec["event_type"] != "file.write" || rec["file_path"] != "/tmp/agent.txt" {
+				t.Fatalf("normalized event = %v", rec)
+			}
+		}
+	}
+	if events != 1 {
+		t.Fatalf("events = %d, want 1", events)
+	}
+}
+
 type failedCollectWriter struct{}
 
 func (failedCollectWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
