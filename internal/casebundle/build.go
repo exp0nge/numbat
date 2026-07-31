@@ -799,7 +799,7 @@ func copyRedactedJSONLines(w io.Writer, in io.Reader) error {
 		}
 		redacted, err := redact.JSON([]byte(body))
 		if err != nil {
-			return fmt.Errorf("line %d: invalid JSON: %w", lineNumber, err)
+			return fmt.Errorf("line %d: cannot safely redact JSON: %w", lineNumber, err)
 		}
 		if _, err := w.Write(redacted); err != nil {
 			return err
@@ -820,7 +820,7 @@ func copyRedactedJSON(w io.Writer, in io.Reader) error {
 	}
 	redacted, err := redact.JSON(raw)
 	if err != nil {
-		return fmt.Errorf("invalid JSON: %w", err)
+		return fmt.Errorf("cannot safely redact JSON: %w", err)
 	}
 	if _, err := w.Write(redacted); err != nil {
 		return err

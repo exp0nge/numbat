@@ -798,9 +798,9 @@ travel. `--include-raw-evidence` copies the cited files verbatim (they can hold
 `.env` contents, keys, or transcripts — share with care), and
 `--include-redacted-evidence` applies best-effort masking to plain text and
 rewrites valid, uncompressed JSON/NDJSON without breaking its syntax. Malformed,
-compressed, binary, or oversized inputs are skipped with a warning. Redacted
-copies can still contain sensitive data; review them before sharing. The
-manifest digests prove *integrity* —
+unsafe-to-redact, compressed, binary, or oversized inputs are skipped with a
+warning. Redacted copies can still contain sensitive data; review them before
+sharing. The manifest digests prove *integrity* —
 that the bundle is self-consistent and unmodified since it was written. These
 digests do not prove authenticity: bundles are unsigned, and anyone can rebuild
 a manifest.

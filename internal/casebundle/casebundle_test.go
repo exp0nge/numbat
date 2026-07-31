@@ -1093,7 +1093,7 @@ func TestEvidenceRedactedRejectsUnsafeStructuredInput(t *testing.T) {
 		body string
 		want string
 	}{
-		{"malformed JSONL", ".jsonl", `{"token":`, "invalid JSON"},
+		{"malformed JSONL", ".jsonl", `{"token":`, "cannot safely redact JSON"},
 		{"credential in JSON key", ".json", `{"ghp_abcdefghijklmnopqrstuvwxyz0123456789":"value"}`, "object key"},
 		{"compressed JSONL", ".jsonl.zst", "compressed", "does not support compressed input"},
 		{"compressed retained archive", ".jsonl.deleted.2026-07-23T10-11-12Z.gz", "compressed", "does not support compressed input"},
