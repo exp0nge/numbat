@@ -1016,6 +1016,8 @@ func TestExtractClaudeSubagentIdentityStampsAllEvents(t *testing.T) {
 // parser coverage gaps.
 func TestExtractClaudeBenignEntryTypesAreSilent(t *testing.T) {
 	lines := []string{
+		`{"type":"custom-title","customTitle":"release review","sessionId":"s-1"}`,
+		`{"type":"relocated","sessionId":"s-1","relocatedCwd":"/home/dev/project"}`,
 		`{"type":"last-prompt","lastPrompt":"fix the merge conflict","sessionId":"s-1"}`,
 		`{"type":"file-history-snapshot","messageId":"m1","snapshot":{"messageId":"m1","trackedFileBackups":{},"timestamp":"2026-04-20T20:25:17.579Z"},"isSnapshotUpdate":false}`,
 		`{"type":"file-history-delta","messageId":"m2","snapshotMessageId":"m1","trackingPath":"/home/dev/project/main.go","backup":{"backupFileName":"main.go@v1","version":1,"backupTime":"2026-04-20T20:25:17.579Z"},"timestamp":"2026-04-20T20:25:17.579Z"}`,
@@ -1030,6 +1032,22 @@ func TestExtractClaudeBenignEntryTypesAreSilent(t *testing.T) {
 		}
 		if len(res.Diagnostics) != 0 {
 			t.Errorf("got %d diagnostics, want 0 for %s: %+v", len(res.Diagnostics), line, res.Diagnostics)
+		}
+	}
+}
+
+func TestExtractClaudeRelocatedCWDSeedsProjectPath(t *testing.T) {
+	body := strings.Join([]string{
+		`{"type":"relocated","sessionId":"s-1","relocatedCwd":"/home/dev/project/.claude/worktrees/review"}`,
+		`{"type":"user","uuid":"u1","sessionId":"s-1","timestamp":"2026-07-09T07:30:00Z","message":{"role":"user","content":"continue"}}`,
+	}, "\n")
+	res := extractFixture(t, body)
+	if len(res.Diagnostics) != 0 {
+		t.Fatalf("got diagnostics: %+v", res.Diagnostics)
+	}
+	for _, ev := range res.Events {
+		if ev.ProjectPath != "/home/dev/project/.claude/worktrees/review" {
+			t.Errorf("%s project_path = %q", ev.EventType, ev.ProjectPath)
 		}
 	}
 }
