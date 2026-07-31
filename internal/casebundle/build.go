@@ -10,8 +10,7 @@
 //
 // Safe by default: a bundle contains findings, cited events, and digests —
 // never copies of raw evidence files. Copying cited files (which can hold
-// .env contents, keys, or transcripts) is a per-build opt-in, raw or with
-// each line redacted.
+// .env contents, keys, or transcripts) is a per-build opt-in, raw or redacted.
 //
 // The manifest's digests prove integrity: that the bundle is self-consistent
 // and unmodified since it was written. They do not prove authenticity or
@@ -28,11 +27,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/perplexityai/numbat/internal/model"
 	"github.com/perplexityai/numbat/internal/output"
@@ -43,8 +44,12 @@ import (
 // maxRecordLine bounds one NDJSON input line, matching the fixture reader's
 // cap so a corrupt stream cannot exhaust memory.
 const (
-	maxRecordLine     = 8 * 1024 * 1024
-	maxResultWarnings = 1_000
+	maxRecordLine                 = 8 * 1024 * 1024
+	maxEvidenceLine               = 16 * 1024 * 1024
+	maxJSONEvidenceBytes          = 64 * 1024 * 1024
+	maxResultWarnings             = 100
+	maxGeneralResultWarnings      = 80
+	maxMalformedWarningsPerSource = 3
 )
 
 // EvidenceMode selects whether cited evidence files are copied into the
@@ -55,10 +60,8 @@ const (
 	EvidenceNone EvidenceMode = iota
 	// EvidenceRaw copies each cited file verbatim into evidence/.
 	EvidenceRaw
-	// EvidenceRedacted copies each cited file with every line passed through
-	// the same redaction findings use, so secret values are masked while the
-	// structure stays reviewable. The manifest digest covers the redacted
-	// bytes (the raw source is not retained to hash).
+	// EvidenceRedacted applies best-effort masking while keeping supported
+	// structured evidence parseable.
 	EvidenceRedacted
 )
 
@@ -91,12 +94,20 @@ type Result struct {
 }
 
 func (r *Result) warn(msg string) {
-	if len(r.Warnings) < maxResultWarnings-1 {
+	r.appendWarning(msg, maxGeneralResultWarnings, "additional warnings suppressed")
+}
+
+func (r *Result) warnEvidence(msg string) {
+	r.appendWarning(msg, maxResultWarnings, "additional evidence warnings suppressed")
+}
+
+func (r *Result) appendWarning(msg string, limit int, suppressed string) {
+	if len(r.Warnings) < limit-1 {
 		r.Warnings = append(r.Warnings, msg)
 		return
 	}
-	if len(r.Warnings) == maxResultWarnings-1 {
-		r.Warnings = append(r.Warnings, "additional warnings suppressed")
+	if len(r.Warnings) == limit-1 {
+		r.Warnings = append(r.Warnings, suppressed)
 	}
 }
 
@@ -504,6 +515,7 @@ func eachLine(sources []string, res *Result, warnMalformed bool, fn func(p probe
 		sc := bufio.NewScanner(f)
 		sc.Buffer(make([]byte, 0, 64*1024), maxRecordLine)
 		line := 0
+		malformed := 0
 		for sc.Scan() {
 			line++
 			raw := sc.Bytes()
@@ -513,7 +525,10 @@ func eachLine(sources []string, res *Result, warnMalformed bool, fn func(p probe
 			var p probe
 			if err := json.Unmarshal(raw, &p); err != nil {
 				if warnMalformed {
-					res.warn(fmt.Sprintf("%s:%d: not a record: %v", src, line, err))
+					malformed++
+					if malformed <= maxMalformedWarningsPerSource {
+						res.warn(fmt.Sprintf("%s:%d: not a record: %v", src, line, err))
+					}
 				}
 				continue
 			}
@@ -525,6 +540,9 @@ func eachLine(sources []string, res *Result, warnMalformed bool, fn func(p probe
 		}
 		if scanErr != nil {
 			return fmt.Errorf("casebundle: read %q: %w", src, scanErr)
+		}
+		if suppressed := malformed - maxMalformedWarningsPerSource; suppressed > 0 {
+			res.warn(fmt.Sprintf("%s: %d additional malformed records suppressed", src, suppressed))
 		}
 	}
 	return nil
@@ -574,11 +592,10 @@ func writeRecords(dir, name string, recs []record) (ManifestFile, error) {
 // copyEvidence copies each cited artifact into evidence/, raw or redacted.
 // Paths are deduplicated and processed in sorted order. A missing or
 // unreadable cited file is a warning — the refs in the findings still locate
-// it on the source machine — and, in raw mode, a copy whose digest does not
-// equal every recorded digest on citing refs warns that the artifact changed
-// after the finding was made. If different findings recorded conflicting
-// digests, any copied value necessarily drifts from at least one of them and
-// therefore warns.
+// it on the source machine. A source digest that does not equal every recorded
+// digest on citing refs warns that the artifact changed after the finding was
+// made. If different findings recorded conflicting digests, any source value
+// necessarily drifts from at least one of them and therefore warns.
 func copyEvidence(opts Options, refs map[model.Evidence]struct{}, res *Result) ([]ManifestFile, error) {
 	byPath := map[string]map[string]struct{}{} // local path -> distinct non-empty recorded sha256s
 	for ref := range refs {
@@ -607,14 +624,14 @@ func copyEvidence(opts Options, refs map[model.Evidence]struct{}, res *Result) (
 	}
 	var files []ManifestFile
 	for _, src := range paths {
-		mf, err := copyOneEvidence(evDir, src, opts.Evidence)
+		mf, sourceSHA256, err := copyOneEvidence(evDir, src, opts.Evidence)
 		if err != nil {
-			res.warn(fmt.Sprintf("evidence %q: %v", src, err))
+			res.warnEvidence(fmt.Sprintf("evidence %q: %v", src, err))
 			continue
 		}
 		recorded := sortedDigests(byPath[src])
-		if opts.Evidence == EvidenceRaw && digestDiffers(recorded, mf.SHA256) {
-			res.warn(evidenceDriftWarning(src, recorded, mf.SHA256))
+		if digestDiffers(recorded, sourceSHA256) {
+			res.warnEvidence(evidenceDriftWarning(src, recorded, sourceSHA256))
 		}
 		files = append(files, mf)
 	}
@@ -640,8 +657,8 @@ func sortedDigests(set map[string]struct{}) []string {
 
 func digestDiffers(recorded []string, copied string) bool {
 	for _, digest := range recorded {
-		// Warn if the copied bytes drift from ANY recorded digest; a mixed set of
-		// recorded digests therefore always warns, even if one digest matches.
+		// Warn if the source bytes drift from ANY recorded digest. A mixed set
+		// therefore always warns, even if one digest matches.
 		if digest != copied {
 			return true
 		}
@@ -649,11 +666,11 @@ func digestDiffers(recorded []string, copied string) bool {
 	return false
 }
 
-func evidenceDriftWarning(src string, recorded []string, copied string) string {
+func evidenceDriftWarning(src string, recorded []string, current string) string {
 	if len(recorded) == 1 {
-		return fmt.Sprintf("evidence %q: content changed since the finding (recorded sha256 %s, copied %s)", src, recorded[0], copied)
+		return fmt.Sprintf("evidence %q: content changed since the finding (recorded sha256 %s, source at copy time %s)", src, recorded[0], current)
 	}
-	return fmt.Sprintf("evidence %q: content changed since the finding (recorded sha256s [%s], copied %s)", src, strings.Join(recorded, ", "), copied)
+	return fmt.Sprintf("evidence %q: content changed since the finding (recorded sha256s [%s], source at copy time %s)", src, strings.Join(recorded, ", "), current)
 }
 
 // copyOneEvidence writes one evidence copy and returns its manifest entry.
@@ -661,32 +678,33 @@ func evidenceDriftWarning(src string, recorded []string, copied string) string {
 // two cited files sharing a basename never collide. The basename is reduced to
 // a portable ASCII segment so odd local filenames do not leak control
 // characters into the bundle.
-func copyOneEvidence(evDir, src string, mode EvidenceMode) (ManifestFile, error) {
+func copyOneEvidence(evDir, src string, mode EvidenceMode) (ManifestFile, string, error) {
 	in, err := openRegularFile(src)
 	if err != nil {
-		return ManifestFile{}, err
+		return ManifestFile{}, "", err
 	}
 
 	name := evidenceCopyName(src)
 	out, err := os.OpenFile(filepath.Join(evDir, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		_ = in.Close()
-		return ManifestFile{}, err
+		return ManifestFile{}, "", err
 	}
 
-	h := sha256.New()
-	w := io.MultiWriter(out, h)
-	copyErr := errors.Join(copyContent(w, in, mode), in.Close(), out.Close())
+	outputHash := sha256.New()
+	sourceHash := sha256.New()
+	w := io.MultiWriter(out, outputHash)
+	copyErr := errors.Join(copyContent(w, io.TeeReader(in, sourceHash), mode, src), in.Close(), out.Close())
 	if copyErr != nil {
 		// Never leave a partial copy behind a clean manifest.
 		_ = os.Remove(filepath.Join(evDir, name))
-		return ManifestFile{}, copyErr
+		return ManifestFile{}, "", copyErr
 	}
 	return ManifestFile{
 		Path:       "evidence/" + name,
-		SHA256:     hex.EncodeToString(h.Sum(nil)),
+		SHA256:     hex.EncodeToString(outputHash.Sum(nil)),
 		SourcePath: src,
-	}, nil
+	}, hex.EncodeToString(sourceHash.Sum(nil)), nil
 }
 
 func evidenceCopyName(src string) string {
@@ -724,16 +742,107 @@ func sanitizeEvidenceBase(base string) string {
 	return cleaned
 }
 
-// copyContent streams the source verbatim, or line-by-line through
-// redact.String when the redacted copy was requested. Redacted copies preserve
-// the source's line endings and final-newline shape; only each line body is
-// transformed.
-func copyContent(w io.Writer, in io.Reader, mode EvidenceMode) error {
+// copyContent streams raw evidence verbatim. Redacted JSON is parsed before it
+// is rewritten so masking cannot corrupt its syntax; supported text remains
+// line-oriented and preserves line endings.
+func copyContent(w io.Writer, in io.Reader, mode EvidenceMode, src string) error {
 	if mode == EvidenceRaw {
 		_, err := io.Copy(w, in)
 		return err
 	}
+	lower := strings.ToLower(filepath.Base(src))
+	base, compressed := trimCompressionSuffix(lower)
+	switch {
+	case compressed:
+		return fmt.Errorf("redacted evidence does not support compressed input; decompress the source first or include it raw")
+	case isJSONLinesName(base):
+		return copyRedactedJSONLines(w, in)
+	case strings.HasSuffix(base, ".json"):
+		return copyRedactedJSON(w, in)
+	default:
+		return copyRedactedText(w, in)
+	}
+}
+
+func trimCompressionSuffix(name string) (string, bool) {
+	for _, suffix := range []string{".zst", ".gz", ".bz2", ".xz", ".zip"} {
+		if strings.HasSuffix(name, suffix) {
+			return strings.TrimSuffix(name, suffix), true
+		}
+	}
+	return name, false
+}
+
+func isJSONLinesName(name string) bool {
+	return strings.HasSuffix(name, ".jsonl") || strings.HasSuffix(name, ".ndjson") ||
+		strings.Contains(name, ".jsonl.") || strings.Contains(name, ".ndjson.")
+}
+
+func copyRedactedJSONLines(w io.Writer, in io.Reader) error {
 	r := bufio.NewReaderSize(in, 64*1024)
+	lineNumber := 0
+	for {
+		line, err := readEvidenceLine(r)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		lineNumber++
+		body, eol := splitLineEnding(line)
+		if strings.TrimSpace(body) == "" {
+			if _, err := io.WriteString(w, body+eol); err != nil {
+				return err
+			}
+			continue
+		}
+		redacted, err := redact.JSON([]byte(body))
+		if err != nil {
+			return fmt.Errorf("line %d: invalid JSON: %w", lineNumber, err)
+		}
+		if _, err := w.Write(redacted); err != nil {
+			return err
+		}
+		if _, err := io.WriteString(w, eol); err != nil {
+			return err
+		}
+	}
+}
+
+func copyRedactedJSON(w io.Writer, in io.Reader) error {
+	raw, err := io.ReadAll(io.LimitReader(in, maxJSONEvidenceBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(raw) > maxJSONEvidenceBytes {
+		return fmt.Errorf("JSON evidence exceeds %d bytes", maxJSONEvidenceBytes)
+	}
+	redacted, err := redact.JSON(raw)
+	if err != nil {
+		return fmt.Errorf("invalid JSON: %w", err)
+	}
+	if _, err := w.Write(redacted); err != nil {
+		return err
+	}
+	switch {
+	case bytes.HasSuffix(raw, []byte("\r\n")):
+		_, err = io.WriteString(w, "\r\n")
+	case bytes.HasSuffix(raw, []byte("\n")):
+		_, err = io.WriteString(w, "\n")
+	}
+	return err
+}
+
+func copyRedactedText(w io.Writer, in io.Reader) error {
+	r := bufio.NewReaderSize(in, 64*1024)
+	sample, err := r.Peek(512)
+	if err != nil && err != io.EOF {
+		return err
+	}
+	if contentType := http.DetectContentType(sample); !strings.HasPrefix(contentType, "text/") {
+		return fmt.Errorf("redacted evidence only supports UTF-8 plain text or JSON (detected %s)", contentType)
+	}
 	for {
 		line, err := readEvidenceLine(r)
 		if err == io.EOF {
@@ -743,6 +852,9 @@ func copyContent(w io.Writer, in io.Reader, mode EvidenceMode) error {
 			return err
 		}
 		body, eol := splitLineEnding(line)
+		if !utf8.ValidString(body) || strings.IndexByte(body, 0) >= 0 {
+			return fmt.Errorf("redacted evidence only supports UTF-8 plain text or JSON")
+		}
 		if _, err := io.WriteString(w, redact.String(body)+eol); err != nil {
 			return err
 		}
@@ -754,8 +866,8 @@ func readEvidenceLine(r *bufio.Reader) (string, error) {
 	for {
 		part, err := r.ReadSlice('\n')
 		line = append(line, part...)
-		if len(line) > maxRecordLine+len("\r\n") {
-			return "", fmt.Errorf("line exceeds %d bytes", maxRecordLine)
+		if len(line) > maxEvidenceLine+len("\r\n") {
+			return "", fmt.Errorf("line exceeds %d bytes", maxEvidenceLine)
 		}
 		switch err {
 		case nil:

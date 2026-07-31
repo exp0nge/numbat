@@ -131,15 +131,55 @@ func (s Source) fullProfile() bool { return s.Profile == ProfileFull }
 type Result struct {
 	// Events are the normalized events, in artifact order.
 	Events []model.Event
-	// Diagnostics record non-fatal parse problems (a malformed line, an
-	// unrecognized record shape) so a caller can surface coverage gaps without
-	// the parse aborting.
+	// Diagnostics record a bounded number of non-fatal parse problems (a
+	// malformed line, an unrecognized record shape) so a caller can surface
+	// coverage gaps without the parse aborting or flooding its output.
 	Diagnostics []Diagnostic
+
+	diagnosticCounts      map[string]int
+	diagnosticsSuppressed bool
 }
+
+const (
+	maxDiagnosticsPerArtifact = 20
+	maxRepeatedDiagnostic     = 3
+)
 
 // diag appends a non-fatal diagnostic to the result.
 func (r *Result) diag(path string, line int, msg string) {
-	r.Diagnostics = append(r.Diagnostics, Diagnostic{Path: path, Line: line, Msg: msg})
+	if r.diagnosticCounts == nil {
+		r.diagnosticCounts = make(map[string]int)
+	}
+	key := path + "\x00" + msg
+	if r.diagnosticCounts[key] >= maxRepeatedDiagnostic {
+		r.suppressDiagnostic(path, line)
+		return
+	}
+	realCount := len(r.Diagnostics)
+	if r.diagnosticsSuppressed {
+		realCount--
+	}
+	if realCount >= maxDiagnosticsPerArtifact-1 {
+		r.suppressDiagnostic(path, line)
+		return
+	}
+	r.diagnosticCounts[key]++
+	diagnostic := Diagnostic{Path: path, Line: line, Msg: msg}
+	if !r.diagnosticsSuppressed {
+		r.Diagnostics = append(r.Diagnostics, diagnostic)
+		return
+	}
+	last := len(r.Diagnostics) - 1
+	r.Diagnostics = append(r.Diagnostics, r.Diagnostics[last])
+	r.Diagnostics[last] = diagnostic
+}
+
+func (r *Result) suppressDiagnostic(path string, line int) {
+	if r.diagnosticsSuppressed {
+		return
+	}
+	r.Diagnostics = append(r.Diagnostics, Diagnostic{Path: path, Line: line, Msg: "additional diagnostics suppressed"})
+	r.diagnosticsSuppressed = true
 }
 
 // Diagnostic is a non-fatal problem encountered while parsing an artifact.

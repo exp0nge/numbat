@@ -28,9 +28,11 @@ var tokenPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----`),
 }
 
+const secretKeyTerm = `(?i:SECRET|TOKEN|PASSWORD|PASSWD|API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY)`
+
 // secretKey matches a secret-looking assignment key (env var, JSON field,
 // YAML key). Capture group 1 is the key text as written.
-const secretKey = `([A-Za-z0-9_."'-]*(?i:SECRET|TOKEN|PASSWORD|PASSWD|API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY)[A-Za-z0-9_."'-]*)`
+const secretKey = `([A-Za-z0-9_."'-]*` + secretKeyTerm + `[A-Za-z0-9_."'-]*)`
 
 // credentialQueryKeys is the set of URL query-parameter keys that carry
 // credential or signature material — the live-auth params a presigned URL

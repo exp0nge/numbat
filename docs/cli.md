@@ -779,7 +779,8 @@ case-scoped findings to bundle.
                              must not exist)
 --include-raw-evidence       copy cited evidence files verbatim (opt-in; may
                              include secrets/transcripts)
---include-redacted-evidence  copy cited evidence files with each line redacted
+--include-redacted-evidence  copy cited plain-text or uncompressed JSON evidence
+                             with best-effort secret masking; review before sharing
                              (mutually exclusive with --include-raw-evidence)
 ```
 
@@ -795,8 +796,11 @@ numbat case verify inv-42.numbat
 By default no evidence file contents are copied — only references and digests
 travel. `--include-raw-evidence` copies the cited files verbatim (they can hold
 `.env` contents, keys, or transcripts — share with care), and
-`--include-redacted-evidence` copies them with each line run through the same
-redaction pipeline used for findings. The manifest digests prove *integrity* —
+`--include-redacted-evidence` applies best-effort masking to plain text and
+rewrites valid, uncompressed JSON/NDJSON without breaking its syntax. Malformed,
+compressed, binary, or oversized inputs are skipped with a warning. Redacted
+copies can still contain sensitive data; review them before sharing. The
+manifest digests prove *integrity* —
 that the bundle is self-consistent and unmodified since it was written. These
 digests do not prove authenticity: bundles are unsigned, and anyone can rebuild
 a manifest.

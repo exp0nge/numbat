@@ -48,7 +48,8 @@ findings, hook enforcement decisions, the events named by their cited_event_ids,
 and a manifest of sha256 digests.
 By default no evidence file contents are copied; only references and digests
 travel. --include-raw-evidence copies the cited files verbatim, and
---include-redacted-evidence copies them with each line redacted.
+--include-redacted-evidence copies plain-text or valid, uncompressed JSON evidence
+with best-effort secret masking; review it before sharing.
 
 verify checks a bundle against its manifest: every listed file must match its
 digest and record count, and the bundle may contain nothing unlisted.
@@ -70,7 +71,7 @@ func newCaseBuildFlagSet(output io.Writer, opts *caseBuildOptions) *flag.FlagSet
 	fs.StringVar(&opts.out, "out", opts.out, "bundle directory to create (must not exist)")
 	fs.Var(&opts.from, "from", "captured NDJSON record-stream file to read (repeatable; required)")
 	fs.BoolVar(&opts.includeRaw, "include-raw-evidence", false, "copy cited evidence files verbatim into the bundle (opt-in: may include secrets/transcripts)")
-	fs.BoolVar(&opts.includeRedacted, "include-redacted-evidence", false, "copy cited evidence files with each line redacted")
+	fs.BoolVar(&opts.includeRedacted, "include-redacted-evidence", false, "copy cited plain-text or uncompressed JSON evidence with best-effort secret masking (review before sharing)")
 	fs.Usage = func() {
 		_, _ = fmt.Fprintln(output, "usage: numbat case build <case-id> --from FILE [--from FILE ...] [-o|--out DIR] [--include-raw-evidence|--include-redacted-evidence]")
 		fs.PrintDefaults()
