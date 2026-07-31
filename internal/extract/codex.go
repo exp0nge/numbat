@@ -25,14 +25,11 @@ const artifactCodexRollout = "codex_rollout"
 //
 // See codex-rs/protocol/src/protocol.rs for the persisted rollout variants.
 //
-// Two layers persist the same activity: a user prompt is written BOTH as a
-// response_item message AND as an event_msg user_message; an apply_patch shows
-// up as a function_call AND a patch_apply_end. To avoid double-counting the
-// timeline, numbat treats the response_item layer as canonical (it is the raw
-// model I/O) and emits from event_msg only the records with no response_item
-// equivalent that still carry forensic signal — a turn that aborted and history
-// that was rolled back. This mirrors the persistence policy in
-// codex-rs/rollout/src/policy.rs, where both layers are written to disk.
+// Tool activity and assistant messages come from response_item. Human prompts
+// prefer the explicit user_message lifecycle record (or paginated UserMessage
+// item), because Codex also stores injected context as role=user response
+// items. Older response-only artifacts retain that role-based fallback. Other
+// duplicate event_msg records are skipped.
 //
 // Codex rollouts are append-only and event-ordered. Forked rollouts may copy the
 // parent's history after the child session_meta; numbat skips that replay until
@@ -75,6 +72,15 @@ type codexState struct {
 	// the opener's timestamp and provenance.
 	lastTimestamp string
 	lastLine      int
+	// explicitUserMessages marks rollouts with user-facing lifecycle records.
+	// responsePromptIDs tracks the older response-item fallback so injected
+	// context can be discarded when an explicit source appears. A headered
+	// rollout holds its latest role=user item until its lifecycle record arrives,
+	// preserving the prompt if the artifact ends between writes.
+	explicitUserMessages  bool
+	userPromptExpected    bool
+	responsePromptIDs     map[string]struct{}
+	pendingResponsePrompt *model.Event
 	// shellCallIDs is the set of call_ids that were a shell command.exec (a
 	// local_shell_call or a shell/shell_command/exec_command function_call), so
 	// the paired function_call_output is promoted from tool.result to
@@ -180,6 +186,7 @@ func (e CodexExtractor) Extract(r io.Reader, src Source) (*Result, error) {
 			if errors.Is(err, io.EOF) {
 				// A truncated final line still ends the stream: close the session
 				// so a capped rollout is not left with a start and no end.
+				flushCodexResponsePrompt(res, st)
 				e.emitSessionEnd(res, src, sha, st)
 				return res, nil
 			}
@@ -191,6 +198,7 @@ func (e CodexExtractor) Extract(r io.Reader, src Source) (*Result, error) {
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				flushCodexResponsePrompt(res, st)
 				e.emitSessionEnd(res, src, sha, st)
 				return res, nil
 			}
@@ -265,6 +273,9 @@ func (e CodexExtractor) mapLine(res *Result, src Source, sha string, st *codexSt
 			st.forkUnreadableLine = 0
 		}
 		st.forkReplay = false
+	}
+	if st.pendingResponsePrompt != nil && !codexUserPromptContinuation(rl) {
+		st.pendingResponsePrompt = nil
 	}
 	if rl.Timestamp != "" {
 		st.lastTimestamp = rl.Timestamp
@@ -422,11 +433,11 @@ func (e CodexExtractor) mapResponseItem(res *Result, src Source, sha string, st 
 	case codexRICustomToolCall:
 		// A new call owns a reused id and its next output.
 		st.resetCall(ri.CallID)
-		if ri.Name == codexToolApplyPatch {
+		if ri.Namespace == "" && ri.Name == codexToolApplyPatch {
 			e.emitApplyPatchCall(res, src, sha, st, line, ts, ri.Name, ri.CallID, string(ri.Input), "/payload/input")
 			return
 		}
-		if ri.Name == codexToolCodeModeExec {
+		if ri.Namespace == "" && ri.Name == codexToolCodeModeExec {
 			if call, ok := parseCodexCodeModeExec(string(ri.Input)); ok {
 				ev := e.base(src, sha, st, line, ts, 0)
 				ev.Actor = model.ActorAssistant
@@ -630,6 +641,15 @@ func (e CodexExtractor) emitMessage(res *Result, src Source, sha string, st *cod
 	ev.Evidence.JSONPointer = "/payload/content"
 	switch ri.Role {
 	case "user":
+		if st.metaSeen || st.explicitUserMessages {
+			if !st.explicitUserMessages || st.userPromptExpected {
+				ev.EventType = model.EventPromptUser
+				ev.Actor = model.ActorUser
+				ev.Confidence = model.ConfidenceMedium
+				st.pendingResponsePrompt = &ev
+			}
+			return
+		}
 		ev.EventType = model.EventPromptUser
 		ev.Actor = model.ActorUser
 	case "assistant":
@@ -641,6 +661,12 @@ func (e CodexExtractor) emitMessage(res *Result, src Source, sha string, st *cod
 		return
 	}
 	res.Events = append(res.Events, ev)
+	if ri.Role == "user" {
+		if st.responsePromptIDs == nil {
+			st.responsePromptIDs = map[string]struct{}{}
+		}
+		st.responsePromptIDs[ev.EventID] = struct{}{}
+	}
 }
 
 // emitFunctionCall maps a response_item function_call onto the normalized event
@@ -650,8 +676,8 @@ func (e CodexExtractor) emitMessage(res *Result, src Source, sha string, st *cod
 // several files, each emitted as its own file.write so the patched paths are
 // first-class. Unknown tools fall back to a generic tool.call.
 func (e CodexExtractor) emitFunctionCall(res *Result, src Source, sha string, st *codexState, line int, ts string, ri *codexResponseItem) {
-	switch ri.Name {
-	case codexToolShell, codexToolShellCommand, codexToolExecCommand:
+	switch {
+	case ri.Namespace == "" && (ri.Name == codexToolShell || ri.Name == codexToolShellCommand || ri.Name == codexToolExecCommand):
 		ev := e.base(src, sha, st, line, ts, 0)
 		ev.Actor = model.ActorAssistant
 		ev.Confidence = model.ConfidenceHigh
@@ -662,9 +688,9 @@ func (e CodexExtractor) emitFunctionCall(res *Result, src Source, sha string, st
 		ev.Evidence.JSONPointer = "/payload/arguments"
 		st.noteShellCall(ri.CallID)
 		res.Events = append(res.Events, ev)
-	case codexToolApplyPatch:
+	case ri.Namespace == "" && ri.Name == codexToolApplyPatch:
 		e.emitApplyPatchCall(res, src, sha, st, line, ts, ri.Name, ri.CallID, string(ri.Arguments), "/payload/arguments")
-	case codexToolReadFile:
+	case ri.Namespace == "" && ri.Name == codexToolReadFile:
 		ev := e.base(src, sha, st, line, ts, 0)
 		ev.Actor = model.ActorAssistant
 		ev.Confidence = model.ConfidenceHigh
@@ -674,7 +700,7 @@ func (e CodexExtractor) emitFunctionCall(res *Result, src Source, sha string, st
 		ev.FilePath = codexArgString(string(ri.Arguments), "path")
 		ev.Evidence.JSONPointer = "/payload/arguments"
 		res.Events = append(res.Events, ev)
-	case codexToolWriteFile, codexToolEditFile:
+	case ri.Namespace == "" && (ri.Name == codexToolWriteFile || ri.Name == codexToolEditFile):
 		ev := e.base(src, sha, st, line, ts, 0)
 		ev.Actor = model.ActorAssistant
 		ev.Confidence = model.ConfidenceHigh
@@ -757,13 +783,8 @@ func (e CodexExtractor) emitApplyPatchCall(res *Result, src Source, sha string, 
 	}
 }
 
-// mapEventMsg decodes an event_msg payload's inner discriminator and emits only
-// the records the response_item layer does not carry: a turn that aborted
-// (interrupted/replaced/budget-limited), history that was rolled back, and the
-// review-mode / thread-goal state transitions that have no response_item twin.
-// All are low-confidence system notes tagged with the record type so the signal
-// is visible rather than a silent gap. Every other event_msg type duplicates a
-// response_item record and is skipped.
+// mapEventMsg decodes the explicit user prompt, structured MCP outcome, and
+// state transitions that are not safely recoverable from response_item alone.
 func (e CodexExtractor) mapEventMsg(res *Result, src Source, sha string, st *codexState, line int, ts string, payload json.RawMessage) {
 	var em codexEventMsg
 	if err := json.Unmarshal(payload, &em); err != nil {
@@ -771,6 +792,14 @@ func (e CodexExtractor) mapEventMsg(res *Result, src Source, sha string, st *cod
 		return
 	}
 	switch em.Type {
+	case codexEMUserMessage:
+		e.emitUserPrompt(res, src, sha, st, line, ts, em.Message, "/payload/message")
+	case codexEMItemCompleted:
+		if message, ok := decodeCodexCompletedUserMessage(em.Item); ok {
+			e.emitUserPrompt(res, src, sha, st, line, ts, message, "/payload/item/content")
+		}
+	case codexEMTaskStarted:
+		st.userPromptExpected = true
 	case codexEMTurnAborted:
 		ev := e.base(src, sha, st, line, ts, 0)
 		ev.EventType = model.EventMessageAssistant
@@ -823,8 +852,8 @@ func (e CodexExtractor) mapEventMsg(res *Result, src Source, sha string, st *cod
 			}
 		}
 	default:
-		// user_message/agent_message/patch_apply_end/... all duplicate a
-		// response_item record; skip to keep the timeline single-counted.
+		// agent_message/patch_apply_end/... duplicate response_item records; skip
+		// them to keep the timeline single-counted.
 		// Unknown/unpersisted types are skipped too.
 		//
 		// No permission.requested/approved/denied is emitted here: the rollout does
@@ -837,6 +866,64 @@ func (e CodexExtractor) mapEventMsg(res *Result, src Source, sha string, st *cod
 		// permission.* vocabulary therefore stays reserved for a future on-disk
 		// signal rather than being synthesized from a heuristic.
 	}
+}
+
+// emitUserPrompt maps the explicit user-facing lifecycle record. Codex uses
+// user_message in legacy histories and item_completed/UserMessage in paginated
+// histories; role=user response items are not sufficient proof of human input.
+func (e CodexExtractor) emitUserPrompt(res *Result, src Source, sha string, st *codexState, line int, ts, message, pointer string) {
+	st.pendingResponsePrompt = nil
+	st.userPromptExpected = false
+	if !st.explicitUserMessages {
+		st.explicitUserMessages = true
+		startID := ""
+		if st.started && st.startIdx < len(res.Events) {
+			startID = res.Events[st.startIdx].EventID
+		}
+		res.Events = discardResponsePromptEvents(res.Events, st.responsePromptIDs)
+		if startID != "" {
+			for i := range res.Events {
+				if res.Events[i].EventID == startID {
+					st.startIdx = i
+					break
+				}
+			}
+		}
+		st.responsePromptIDs = nil
+	}
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return
+	}
+	ev := e.base(src, sha, st, line, ts, 0)
+	ev.EventType = model.EventPromptUser
+	ev.Actor = model.ActorUser
+	ev.Confidence = model.ConfidenceHigh
+	ev.ContentPreview = preview(message)
+	ev.Evidence.JSONPointer = pointer
+	res.Events = append(res.Events, ev)
+}
+
+func flushCodexResponsePrompt(res *Result, st *codexState) {
+	if st.pendingResponsePrompt == nil {
+		return
+	}
+	res.Events = append(res.Events, *st.pendingResponsePrompt)
+	st.pendingResponsePrompt = nil
+}
+
+func discardResponsePromptEvents(events []model.Event, ids map[string]struct{}) []model.Event {
+	if len(ids) == 0 {
+		return events
+	}
+	out := events[:0]
+	for _, ev := range events {
+		if _, discard := ids[ev.EventID]; discard {
+			continue
+		}
+		out = append(out, ev)
+	}
+	return out
 }
 
 // markToolResultError stamps TagToolError on the already-emitted tool.result

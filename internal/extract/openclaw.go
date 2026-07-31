@@ -59,9 +59,14 @@ type openClawState struct {
 	// emitted. The later output consults this so it still carries the tool-error
 	// signal regardless of the order the two layers land in the transcript —
 	// mirroring codexState.failedMCPCallIDs.
-	failedMCPCallIDs map[string]struct{}
-	toolEvents       int
-	recognizedRows   int
+	failedMCPCallIDs           map[string]struct{}
+	codexMetaSeen              bool
+	codexExplicitUserMessages  bool
+	codexUserPromptExpected    bool
+	codexResponsePromptIDs     map[string]struct{}
+	pendingCodexResponsePrompt *model.Event
+	toolEvents                 int
+	recognizedRows             int
 }
 
 // noteCommandCall records a tool-call id that was a command (shell/exec) so its
@@ -167,6 +172,9 @@ func (e OpenClawExtractor) Extract(r io.Reader, src Source) (*Result, error) {
 		}
 	}
 
+	if flavor == openClawFlavorCodex {
+		flushOpenClawCodexResponsePrompt(res, st)
+	}
 	e.surfaceCoverageGap(res, src, flavor, nonBlank, skippedLong, st)
 	return res, nil
 }

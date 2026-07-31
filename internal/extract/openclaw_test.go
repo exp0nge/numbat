@@ -1725,4 +1725,176 @@ func TestOpenClawCodexOuterTimestamp(t *testing.T) {
 	}
 }
 
+func TestOpenClawCodexPrefersUserMessageEvent(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"t0","type":"session_meta","payload":{"id":"cx","cwd":"/w"}}`,
+		`{"timestamp":"t1","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>injected</environment_context>"}]}}`,
+		`{"timestamp":"t2","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"human prompt"}]}}`,
+		`{"timestamp":"t3","type":"event_msg","payload":{"type":"user_message","message":"human prompt"}}`,
+	}
+	res := extractOpenClaw(t, strings.Join(lines, "\n"))
+	if len(res.Events) != 1 || res.Events[0].EventType != model.EventPromptUser || res.Events[0].ContentPreview != "human prompt" {
+		t.Fatalf("canonical prompt mapping = %+v", res.Events)
+	}
+	if res.Events[0].Evidence.Line != 4 || res.Events[0].Evidence.JSONPointer != "/payload/message" {
+		t.Errorf("canonical prompt provenance = line %d %q", res.Events[0].Evidence.Line, res.Events[0].Evidence.JSONPointer)
+	}
+	assertOpenClawPointersResolve(t, res, lines)
+}
+
+func TestOpenClawCodexPaginatedUserMessage(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"t0","type":"session_meta","payload":{"id":"cx","cwd":"/w","history_mode":"paginated"}}`,
+		`{"timestamp":"t1","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"paginated prompt"}]}}`,
+		`{"timestamp":"t2","type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","id":"u1","content":[{"type":"text","text":"paginated"},{"type":"text","text":" "},{"type":"text","text":"prompt"}]}}}`,
+	}
+	res := extractOpenClaw(t, strings.Join(lines, "\n"))
+	if len(res.Events) != 1 || res.Events[0].EventType != model.EventPromptUser || res.Events[0].ContentPreview != "paginated prompt" {
+		t.Fatalf("paginated prompt mapping = %+v", res.Events)
+	}
+	if res.Events[0].Evidence.Line != 3 || res.Events[0].Evidence.JSONPointer != "/payload/item/content" {
+		t.Errorf("paginated prompt provenance = line %d %q", res.Events[0].Evidence.Line, res.Events[0].Evidence.JSONPointer)
+	}
+	assertOpenClawPointersResolve(t, res, lines)
+}
+
+func TestOpenClawCodexResponsePromptFallbacks(t *testing.T) {
+	tests := []struct {
+		name        string
+		lines       []string
+		wantLine    int
+		wantPointer string
+	}{
+		{
+			name: "headerless response only",
+			lines: []string{
+				`{"timestamp":"t1","type":"response_item","payload":{"type":"message","role":"user","content":"human prompt"}}`,
+			},
+			wantLine:    1,
+			wantPointer: "/payload/content",
+		},
+		{
+			name: "headerless response replaced by explicit prompt",
+			lines: []string{
+				`{"timestamp":"t1","type":"response_item","payload":{"type":"message","role":"user","content":"human prompt"}}`,
+				`{"timestamp":"t2","type":"event_msg","payload":{"type":"user_message","message":"human prompt"}}`,
+			},
+			wantLine:    2,
+			wantPointer: "/payload/message",
+		},
+		{
+			name: "headered response retained at EOF",
+			lines: []string{
+				`{"timestamp":"t0","type":"session_meta","payload":{"id":"cx","cwd":"/w"}}`,
+				`{"timestamp":"t1","type":"response_item","payload":{"type":"message","role":"user","content":"human prompt"}}`,
+			},
+			wantLine:    2,
+			wantPointer: "/payload/content",
+		},
+		{
+			name: "paginated response retained after item start",
+			lines: []string{
+				`{"timestamp":"t0","type":"session_meta","payload":{"id":"cx","cwd":"/w"}}`,
+				`{"timestamp":"t1","type":"response_item","payload":{"type":"message","role":"user","content":"human prompt"}}`,
+				`{"timestamp":"t2","type":"event_msg","payload":{"type":"item_started","item":{"type":"UserMessage","content":[{"type":"text","text":"human prompt"}]}}}`,
+			},
+			wantLine:    2,
+			wantPointer: "/payload/content",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			res := extractOpenClaw(t, strings.Join(tc.lines, "\n"))
+			if len(res.Events) != 1 || res.Events[0].EventType != model.EventPromptUser || res.Events[0].ContentPreview != "human prompt" {
+				t.Fatalf("prompt fallback = %+v", res.Events)
+			}
+			if res.Events[0].Evidence.Line != tc.wantLine || res.Events[0].Evidence.JSONPointer != tc.wantPointer {
+				t.Errorf("prompt provenance = line %d %q", res.Events[0].Evidence.Line, res.Events[0].Evidence.JSONPointer)
+			}
+			assertOpenClawPointersResolve(t, res, tc.lines)
+		})
+	}
+}
+
+func TestOpenClawCodexDoesNotFlushInjectedContext(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"t0","type":"session_meta","payload":{"id":"cx","cwd":"/w"}}`,
+		`{"timestamp":"t1","type":"response_item","payload":{"type":"message","role":"user","content":"<environment_context>injected</environment_context>"}}`,
+		`{"timestamp":"t2","type":"world_state","payload":{"full":false}}`,
+	}
+	if res := extractOpenClaw(t, strings.Join(lines, "\n")); len(res.Events) != 0 {
+		t.Fatalf("injected context became a prompt: %+v", res.Events)
+	}
+}
+
+func TestOpenClawCodexNamespacedNativeNamesStayGeneric(t *testing.T) {
+	cases := []struct {
+		name   string
+		tool   string
+		call   string
+		output string
+	}{
+		{
+			name:   "exec command",
+			tool:   "exec_command",
+			call:   `{"timestamp":"t1","type":"response_item","payload":{"type":"function_call","namespace":"mcp__remote","name":"exec_command","call_id":"c","arguments":"{\"cmd\":\"id\"}"}}`,
+			output: `{"timestamp":"t2","type":"response_item","payload":{"type":"function_call_output","call_id":"c","output":"uid=1"}}`,
+		},
+		{
+			name:   "apply patch",
+			tool:   "apply_patch",
+			call:   `{"timestamp":"t1","type":"response_item","payload":{"type":"function_call","namespace":"mcp__remote","name":"apply_patch","call_id":"c","arguments":"{\"patch\":\"*** Begin Patch\\n*** Add File: x\\n+x\\n*** End Patch\"}"}}`,
+			output: `{"timestamp":"t2","type":"response_item","payload":{"type":"function_call_output","call_id":"c","output":"done"}}`,
+		},
+		{
+			name:   "read file",
+			tool:   "read_file",
+			call:   `{"timestamp":"t1","type":"response_item","payload":{"type":"function_call","namespace":"mcp__remote","name":"read_file","call_id":"c","arguments":"{\"path\":\"/etc/passwd\"}"}}`,
+			output: `{"timestamp":"t2","type":"response_item","payload":{"type":"function_call_output","call_id":"c","output":"body"}}`,
+		},
+		{
+			name:   "create file",
+			tool:   "create_file",
+			call:   `{"timestamp":"t1","type":"response_item","payload":{"type":"function_call","namespace":"mcp__remote","name":"create_file","call_id":"c","arguments":"{\"path\":\"/tmp/x\"}"}}`,
+			output: `{"timestamp":"t2","type":"response_item","payload":{"type":"function_call_output","call_id":"c","output":"done"}}`,
+		},
+		{
+			name:   "edit file",
+			tool:   "edit_file",
+			call:   `{"timestamp":"t1","type":"response_item","payload":{"type":"function_call","namespace":"mcp__remote","name":"edit_file","call_id":"c","arguments":"{\"path\":\"/tmp/x\"}"}}`,
+			output: `{"timestamp":"t2","type":"response_item","payload":{"type":"function_call_output","call_id":"c","output":"done"}}`,
+		},
+		{
+			name:   "code mode exec",
+			tool:   "exec",
+			call:   `{"timestamp":"t1","type":"response_item","payload":{"type":"custom_tool_call","namespace":"mcp__remote","name":"exec","call_id":"c","input":"await tools.exec_command({cmd: 'id'})"}}`,
+			output: `{"timestamp":"t2","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c","output":"uid=1"}}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			lines := []string{
+				`{"timestamp":"t0","type":"session_meta","payload":{"id":"cx","cwd":"/w"}}`,
+				tc.call,
+				tc.output,
+			}
+			res := extractOpenClaw(t, strings.Join(lines, "\n"))
+			if len(res.Events) != 2 {
+				t.Fatalf("got %d events, want call + result: %+v", len(res.Events), res.Events)
+			}
+			call, result := res.Events[0], res.Events[1]
+			if call.EventType != model.EventToolCall || call.ToolName != tc.tool || call.MCPServer != "remote" || call.MCPTool != tc.tool {
+				t.Errorf("call was specialized or lost namespace: %+v", call)
+			}
+			if call.Command != "" || call.FilePath != "" || call.DiffSHA256 != "" {
+				t.Errorf("generic MCP call carries fabricated native fields: %+v", call)
+			}
+			if result.EventType != model.EventToolResult || result.ToolCallID != "c" {
+				t.Errorf("result was promoted to a native result: %+v", result)
+			}
+			assertOpenClawPointersResolve(t, res, lines)
+		})
+	}
+}
+
 func intPtr(v int) *int { return &v }

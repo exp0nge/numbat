@@ -46,11 +46,12 @@ const (
 	codexRIContextCompaction = "context_compaction"
 )
 
-// Codex event_msg inner payload types numbat interprets. The conversation and
-// tool timeline comes from response_item; event_msg contributes only distinct
-// state changes, structured MCP failure, and the task boundary used to exclude
-// copied history from forked rollouts.
+// Codex event_msg types numbat interprets: explicit user prompts, distinct
+// state changes, structured MCP outcomes, and fork boundaries.
 const (
+	codexEMUserMessage      = "user_message"
+	codexEMItemStarted      = "item_started"
+	codexEMItemCompleted    = "item_completed"
 	codexEMTurnAborted      = "turn_aborted"
 	codexEMThreadRolledBack = "thread_rolled_back"
 	// task_started is a fork replay boundary, not an emitted timeline event.
@@ -239,14 +240,13 @@ type codexLocalShellAction struct {
 	Command []string `json:"command"`
 }
 
-// codexEventMsg is the tolerant view of an event_msg payload's inner
-// discriminator plus the fields of the few variants numbat surfaces. CallID and
-// Result are read only from an mcp_tool_call_end: they carry the structured MCP
-// outcome correlated back to the response_item layer by call_id.
+// codexEventMsg is the tolerant view of the event_msg variants numbat uses.
 type codexEventMsg struct {
-	Type   string `json:"type"`
-	TurnID string `json:"turn_id"`
-	Reason string `json:"reason"`
+	Type    string          `json:"type"`
+	TurnID  string          `json:"turn_id"`
+	Reason  string          `json:"reason"`
+	Message string          `json:"message"`
+	Item    json.RawMessage `json:"item"`
 	// CallID joins an mcp_tool_call_end to the custom_tool_call(_output) the
 	// response_item layer already emitted for the same MCP invocation.
 	CallID string `json:"call_id"`
@@ -255,6 +255,44 @@ type codexEventMsg struct {
 	// codexMcpResultIsError; left raw here so a shape numbat does not recognize is
 	// tolerated rather than failing the whole event_msg decode.
 	Result json.RawMessage `json:"result"`
+}
+
+type codexTurnItem struct {
+	Type    string             `json:"type"`
+	Content []codexContentItem `json:"content"`
+}
+
+func decodeCodexCompletedUserMessage(raw json.RawMessage) (string, bool) {
+	var item codexTurnItem
+	if json.Unmarshal(raw, &item) != nil || item.Type != "UserMessage" {
+		return "", false
+	}
+	parts := make([]string, 0, len(item.Content))
+	for _, content := range item.Content {
+		if content.Type == "text" {
+			parts = append(parts, content.Text)
+		}
+	}
+	return strings.Join(parts, ""), true
+}
+
+func codexUserPromptContinuation(line codexLine) bool {
+	if line.Type != codexTypeEventMsg {
+		return false
+	}
+	var event codexEventMsg
+	if json.Unmarshal(line.Payload, &event) != nil {
+		return true
+	}
+	switch event.Type {
+	case codexEMUserMessage:
+		return true
+	case codexEMItemStarted, codexEMItemCompleted:
+		var item codexTurnItem
+		return json.Unmarshal(event.Item, &item) == nil && item.Type == "UserMessage"
+	default:
+		return false
+	}
 }
 
 // codexMcpResultIsError reports whether an mcp_tool_call_end's result records a

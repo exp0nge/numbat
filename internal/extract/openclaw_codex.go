@@ -14,30 +14,20 @@ import (
 // decodes that format with full fidelity, reusing the Codex wire helpers
 // (codex_entry.go) so the two extractors stay in lockstep on the on-disk shape.
 //
-// Only the structurally-confirmed forensic signals are surfaced: function_call
-// (shell→command.exec, apply_patch→file.write/delete, read/write/edit file,
-// canonical MCP fetch→network.indicator, else tool.call), function_call_output
-// (correlated by call_id to a command.result or tool.result), local_shell_call,
-// and web_search_call. From the event_msg layer, only the records with no
-// response_item twin are surfaced: a structured mcp_tool_call_end failure tags
-// the matching tool.result TagToolError, and the no-twin state transitions
-// (turn_aborted / thread_rolled_back / review-mode / thread-goal) become
-// low-confidence system notes (see mapCodexEventMsg). Per the high-precision
-// boundary, legacy shell output never has its prose scraped for an exit code,
-// and a tool-error tag is set only from a structured field.
+// The mapping follows the native Codex extractor: explicit lifecycle records
+// identify human prompts, response_item carries assistant/tool activity, and
+// structured event_msg outcomes enrich correlated results.
 
-// mapCodexLine decodes one Codex-flavor OpenClaw line and dispatches on the
-// outer record type. A malformed line is a diagnostic and is skipped; the rest of
-// the file still parses. session_meta / turn_context seed and update the session
-// working directory; response_item carries the tool/message timeline; event_msg
-// is routed to mapCodexEventMsg, which surfaces only the no-response_item-twin
-// signals (structured MCP tool-error, no-twin state transitions) and skips the
-// duplicate types — mirroring the canonical Codex extractor (codex.go mapEventMsg).
+// mapCodexLine dispatches an embedded Codex rollout row while retaining
+// OpenClaw's identity and event IDs.
 func (e OpenClawExtractor) mapCodexLine(res *Result, src Source, sha string, st *openClawState, line int, raw []byte) {
 	var lineRec codexLine
 	if err := json.Unmarshal(raw, &lineRec); err != nil {
 		res.diag(src.Path, line, "malformed JSON line")
 		return
+	}
+	if st.pendingCodexResponsePrompt != nil && !codexUserPromptContinuation(lineRec) {
+		st.pendingCodexResponsePrompt = nil
 	}
 	// Codex rollout rows carry their timestamp on the outer envelope. Reset it
 	// for every row so a legacy/malformed row cannot inherit its predecessor.
@@ -45,6 +35,7 @@ func (e OpenClawExtractor) mapCodexLine(res *Result, src Source, sha string, st 
 	switch lineRec.Type {
 	case openClawTypeSessionMeta:
 		st.recognizedRows++
+		st.codexMetaSeen = true
 		var meta codexSessionMeta
 		if json.Unmarshal(lineRec.Payload, &meta) == nil {
 			if st.sessionID == "" {
@@ -188,7 +179,7 @@ func (e OpenClawExtractor) mapCodexResponseItem(res *Result, src Source, sha str
 	case codexRICustomToolCall:
 		// A new call owns a reused id and its next output.
 		st.resetCall(ri.CallID)
-		if ri.Name == codexToolCodeModeExec {
+		if ri.Namespace == "" && ri.Name == codexToolCodeModeExec {
 			if call, ok := parseCodexCodeModeExec(string(ri.Input)); ok {
 				ev := e.base(src, sha, st, line, 0)
 				ev.Actor = model.ActorAssistant
@@ -269,23 +260,8 @@ func (e OpenClawExtractor) mapCodexResponseItem(res *Result, src Source, sha str
 	}
 }
 
-// mapCodexEventMsg decodes a Codex-flavor event_msg payload and surfaces only the
-// records the response_item layer does not carry, reusing the same wire types and
-// helpers as the canonical extractor (codexEventMsg / codexMcpResultIsError /
-// markToolResultError) routed through OpenClaw's event base/id/state. It is the
-// OpenClaw mirror of codex.go mapEventMsg:
-//   - mcp_tool_call_end: read ONLY the structured Result; on a recorded failure tag
-//     the already-emitted tool.result for the call_id TagToolError, or — when the
-//     end-event preceded the output — note the failed call_id so the later output is
-//     tagged. Success / unrecognized shape leaves the tool.result untagged (never
-//     scrape prose).
-//   - turn_aborted / thread_rolled_back / entered_review_mode / exited_review_mode /
-//     thread_goal_updated: low-confidence message.assistant system notes tagged with
-//     the transition type, JSONPointer /payload (the OpenClaw outer row is
-//     {timestamp,type,payload}, so /payload resolves).
-//   - every other type duplicates a response_item record and is skipped.
-//
-// A malformed payload is a diagnostic and skipped (no panic).
+// mapCodexEventMsg mirrors codex.go for explicit prompts, state transitions,
+// and structured MCP failures. Duplicate lifecycle records are skipped.
 func (e OpenClawExtractor) mapCodexEventMsg(res *Result, src Source, sha string, st *openClawState, line int, payload json.RawMessage) {
 	var em codexEventMsg
 	if err := json.Unmarshal(payload, &em); err != nil {
@@ -293,6 +269,14 @@ func (e OpenClawExtractor) mapCodexEventMsg(res *Result, src Source, sha string,
 		return
 	}
 	switch em.Type {
+	case codexEMUserMessage:
+		e.emitCodexUserPrompt(res, src, sha, st, line, em.Message, "/payload/message")
+	case codexEMItemCompleted:
+		if message, ok := decodeCodexCompletedUserMessage(em.Item); ok {
+			e.emitCodexUserPrompt(res, src, sha, st, line, message, "/payload/item/content")
+		}
+	case codexEMTaskStarted:
+		st.codexUserPromptExpected = true
 	case codexEMTurnAborted:
 		ev := e.base(src, sha, st, line, 0)
 		ev.EventType = model.EventMessageAssistant
@@ -329,17 +313,13 @@ func (e OpenClawExtractor) mapCodexEventMsg(res *Result, src Source, sha string,
 			}
 		}
 	default:
-		// user_message / agent_message / patch_apply_end / ... duplicate a
-		// response_item record; unknown/unpersisted types are skipped too. Same
-		// single-counted-timeline posture as codex.go (no permission.* synthesized).
+		// agent_message / patch_apply_end / ... duplicate response_item records;
+		// unknown and unpersisted types are skipped too.
 	}
 }
 
-// emitCodexMessage emits a prompt.user or message.assistant from a Codex
-// response_item message. role determines the actor; developer/system messages are
-// instructions, not agent activity, and are skipped. An empty body yields
-// nothing. Prose is a message event (not a tool event), so it does not advance
-// the tool-activity counter.
+// emitCodexMessage emits assistant prose and the compatibility prompt fallback
+// used only when no explicit user-message lifecycle record appears.
 func (e OpenClawExtractor) emitCodexMessage(res *Result, src Source, sha string, st *openClawState, line int, ri *codexResponseItem) {
 	text := strings.TrimSpace(decodeCodexContentText(ri.Content))
 	if text == "" {
@@ -351,6 +331,17 @@ func (e OpenClawExtractor) emitCodexMessage(res *Result, src Source, sha string,
 	ev.Evidence.JSONPointer = "/payload/content"
 	switch ri.Role {
 	case "user":
+		if st.codexMetaSeen || st.codexExplicitUserMessages {
+			if !st.codexExplicitUserMessages || st.codexUserPromptExpected {
+				ev.EventType = model.EventPromptUser
+				ev.Actor = model.ActorUser
+				ev.Confidence = model.ConfidenceMedium
+				ev.SessionID = st.sessionID
+				ev.ProjectPath = st.projectPath
+				st.pendingCodexResponsePrompt = &ev
+			}
+			return
+		}
 		ev.EventType = model.EventPromptUser
 		ev.Actor = model.ActorUser
 	case "assistant":
@@ -361,6 +352,41 @@ func (e OpenClawExtractor) emitCodexMessage(res *Result, src Source, sha string,
 		return
 	}
 	res.appendEvent(st, ev, false)
+	if ri.Role == "user" {
+		if st.codexResponsePromptIDs == nil {
+			st.codexResponsePromptIDs = map[string]struct{}{}
+		}
+		st.codexResponsePromptIDs[ev.EventID] = struct{}{}
+	}
+}
+
+func (e OpenClawExtractor) emitCodexUserPrompt(res *Result, src Source, sha string, st *openClawState, line int, message, pointer string) {
+	st.pendingCodexResponsePrompt = nil
+	st.codexUserPromptExpected = false
+	if !st.codexExplicitUserMessages {
+		st.codexExplicitUserMessages = true
+		res.Events = discardResponsePromptEvents(res.Events, st.codexResponsePromptIDs)
+		st.codexResponsePromptIDs = nil
+	}
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return
+	}
+	ev := e.base(src, sha, st, line, 0)
+	ev.EventType = model.EventPromptUser
+	ev.Actor = model.ActorUser
+	ev.Confidence = model.ConfidenceHigh
+	ev.ContentPreview = preview(message)
+	ev.Evidence.JSONPointer = pointer
+	res.appendEvent(st, ev, false)
+}
+
+func flushOpenClawCodexResponsePrompt(res *Result, st *openClawState) {
+	if st.pendingCodexResponsePrompt == nil {
+		return
+	}
+	res.Events = append(res.Events, *st.pendingCodexResponsePrompt)
+	st.pendingCodexResponsePrompt = nil
 }
 
 // emitCodexFunctionCall maps a Codex response_item function_call onto the
@@ -371,8 +397,8 @@ func (e OpenClawExtractor) emitCodexMessage(res *Result, src Source, sha string,
 // fetch→network.indicator, and every other tool→a generic tool.call. Mirrors
 // codex.go emitFunctionCall but routes through OpenClaw's id/state/counter.
 func (e OpenClawExtractor) emitCodexFunctionCall(res *Result, src Source, sha string, st *openClawState, line int, ri *codexResponseItem) {
-	switch ri.Name {
-	case codexToolShell, codexToolShellCommand, codexToolExecCommand:
+	switch {
+	case ri.Namespace == "" && (ri.Name == codexToolShell || ri.Name == codexToolShellCommand || ri.Name == codexToolExecCommand):
 		ev := e.base(src, sha, st, line, 0)
 		ev.Actor = model.ActorAssistant
 		ev.Confidence = model.ConfidenceHigh
@@ -383,7 +409,7 @@ func (e OpenClawExtractor) emitCodexFunctionCall(res *Result, src Source, sha st
 		ev.Evidence.JSONPointer = "/payload/arguments"
 		st.noteCommandCall(ri.CallID)
 		res.appendEvent(st, ev, true)
-	case codexToolApplyPatch:
+	case ri.Namespace == "" && ri.Name == codexToolApplyPatch:
 		// apply_patch is a REQUEST to change files, not a confirmed write: the
 		// function_call records intent. numbat emits the requested changes at
 		// medium confidence with an intent tag, the same single-layer posture
@@ -422,7 +448,7 @@ func (e OpenClawExtractor) emitCodexFunctionCall(res *Result, src Source, sha st
 			ev.Evidence.JSONPointer = "/payload/arguments"
 			res.appendEvent(st, ev, true)
 		}
-	case codexToolReadFile:
+	case ri.Namespace == "" && ri.Name == codexToolReadFile:
 		ev := e.base(src, sha, st, line, 0)
 		ev.Actor = model.ActorAssistant
 		ev.Confidence = model.ConfidenceHigh
@@ -432,7 +458,7 @@ func (e OpenClawExtractor) emitCodexFunctionCall(res *Result, src Source, sha st
 		ev.FilePath = codexArgString(string(ri.Arguments), "path")
 		ev.Evidence.JSONPointer = "/payload/arguments"
 		res.appendEvent(st, ev, true)
-	case codexToolWriteFile, codexToolEditFile:
+	case ri.Namespace == "" && (ri.Name == codexToolWriteFile || ri.Name == codexToolEditFile):
 		ev := e.base(src, sha, st, line, 0)
 		ev.Actor = model.ActorAssistant
 		ev.Confidence = model.ConfidenceHigh
