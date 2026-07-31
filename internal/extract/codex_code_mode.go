@@ -11,6 +11,8 @@ import (
 // call; arbitrary or compound programs stay generic tool.call events.
 var codexCodeModeExecPrefix = regexp.MustCompile(`^const[[:space:]]+([A-Za-z_$][A-Za-z0-9_$]*)[[:space:]]*=[[:space:]]*await[[:space:]]+tools\.exec_command[[:space:]]*\([[:space:]]*`)
 
+const codexCodeModeStringToken = "<string>"
+
 func codexCodeModeExecCommand(input string) (string, bool) {
 	s := strings.TrimSpace(input)
 	if strings.HasPrefix(s, "// @exec:") {
@@ -71,7 +73,8 @@ func isCodexCodeModeResultTail(s, resultName string) bool {
 		return false
 	}
 	if codexCodeModeTokensEqual(tokens, "text", "(", resultName, ")") ||
-		codexCodeModeTokensEqual(tokens, "text", "(", resultName, ".", "output", ")") {
+		codexCodeModeTokensEqual(tokens, "text", "(", resultName, ".", "output", ")") ||
+		codexCodeModeTokensEqual(tokens, "text", "(", resultName, ".", "output", "||", codexCodeModeStringToken, ")") {
 		return true
 	}
 	return resultName != "JSON" && codexCodeModeTokensEqual(tokens,
@@ -92,6 +95,21 @@ func codexCodeModeTailTokens(s string) ([]string, bool) {
 			}
 			tokens = append(tokens, s[i:end])
 			i = end
+			continue
+		}
+		if s[i] == '"' {
+			var value string
+			decoder := json.NewDecoder(strings.NewReader(s[i:]))
+			if err := decoder.Decode(&value); err != nil || decoder.InputOffset() <= 0 {
+				return nil, false
+			}
+			tokens = append(tokens, codexCodeModeStringToken)
+			i += int(decoder.InputOffset())
+			continue
+		}
+		if strings.HasPrefix(s[i:], "||") {
+			tokens = append(tokens, "||")
+			i += 2
 			continue
 		}
 		switch s[i] {

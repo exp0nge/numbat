@@ -153,6 +153,10 @@ actions are specialized the same way. `tool.call` is the fallback when numbat
 cannot safely specialize the action. A later `command.result` is the correlated
 outcome, not a second invocation.
 
+Do not add `tool.call` as a catch-all branch to a command rule. Generic tool
+calls have no `event.command`; write a separate tool rule only when the generic
+tool identity is itself the signal.
+
 For command activity, choose the events you mean. Hooks and artifacts normally
 provide the requested action as `command.exec`. Some OTLP sources expose only a
 completed `command.result`, so shipped command rules commonly use:

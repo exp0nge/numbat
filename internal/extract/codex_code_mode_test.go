@@ -46,6 +46,14 @@ func TestCodexCodeModeCommandAcceptsASIStatementBoundary(t *testing.T) {
 	}
 }
 
+func TestCodexCodeModeCommandAcceptsStaticOutputFallback(t *testing.T) {
+	input := `const r = await tools.exec_command({cmd:"git status"}); text(r.output || "(no output)");`
+	command, ok := codexCodeModeExecCommand(input)
+	if !ok || command != "git status" {
+		t.Fatalf("command = %q, ok = %v, want git status/true", command, ok)
+	}
+}
+
 func TestExtractCodexAmbiguousCodeModeExecStaysGeneric(t *testing.T) {
 	tests := map[string]string{
 		"dynamic command":         `const r = await tools.exec_command({cmd: command}); text(r.output);`,
@@ -56,6 +64,7 @@ func TestExtractCodexAmbiguousCodeModeExecStaysGeneric(t *testing.T) {
 		"second nested tool":      `const r = await tools.exec_command({cmd:"git status"}); await tools.write_stdin({session_id:r.session_id});`,
 		"parallel nested tools":   `const rs = await Promise.all([tools.exec_command({cmd:"git status"}), tools.exec_command({cmd:"git diff"})]); text(rs);`,
 		"additional statement":    `const r = await tools.exec_command({cmd:"git status"}); text(r.output); exit();`,
+		"dynamic output fallback": `const r = await tools.exec_command({cmd:"git status"}); text(r.output || fallback);`,
 		"missing statement break": `const r = await tools.exec_command({cmd:"git status"}) text(r.output);`,
 		"reserved binding":        `const await = await tools.exec_command({cmd:"git status"});`,
 		"split text identifier":   `const r = await tools.exec_command({cmd:"git status"}); te xt(r);`,
