@@ -52,10 +52,9 @@ type openClawState struct {
 	projectPath      string
 	currentTimestamp string
 	commandCalls     map[string]struct{}
-	// codexCodeModeCommandCalls is separate from commandCalls so an unrelated
-	// custom output cannot inherit a direct function call's classification when
-	// a malformed transcript reuses a call id.
-	codexCodeModeCommandCalls map[string]struct{}
+	// codexCodeModeCommandCalls records how an embedded Codex exec cell forwards
+	// its result. It remains separate from direct function-call correlation.
+	codexCodeModeCommandCalls map[string]codexCodeModeResultKind
 	// failedMCPCallIDs is the set of call_ids whose Codex-flavor mcp_tool_call_end
 	// recorded a structured failure BEFORE the matching custom_tool_call_output was
 	// emitted. The later output consults this so it still carries the tool-error
@@ -84,24 +83,24 @@ func (st *openClawState) isCommandCall(id string) bool {
 	return ok
 }
 
-func (st *openClawState) noteCodexCodeModeCommandCall(id string) {
+func (st *openClawState) noteCodexCodeModeCommandCall(id string, resultKind codexCodeModeResultKind) {
 	if id == "" {
 		return
 	}
 	if st.codexCodeModeCommandCalls == nil {
-		st.codexCodeModeCommandCalls = map[string]struct{}{}
+		st.codexCodeModeCommandCalls = map[string]codexCodeModeResultKind{}
 	}
-	st.codexCodeModeCommandCalls[id] = struct{}{}
+	st.codexCodeModeCommandCalls[id] = resultKind
 }
 
 func (st *openClawState) forgetCodexCodeModeCommandCall(id string) {
 	delete(st.codexCodeModeCommandCalls, id)
 }
 
-func (st *openClawState) takeCodexCodeModeCommandCall(id string) bool {
-	_, ok := st.codexCodeModeCommandCalls[id]
+func (st *openClawState) takeCodexCodeModeCommandCall(id string) (codexCodeModeResultKind, bool) {
+	resultKind, ok := st.codexCodeModeCommandCalls[id]
 	delete(st.codexCodeModeCommandCalls, id)
-	return ok
+	return resultKind, ok
 }
 
 // noteFailedMCPCall records a call_id whose mcp_tool_call_end reported a

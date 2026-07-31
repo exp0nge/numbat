@@ -70,10 +70,9 @@ type codexState struct {
 	// the paired function_call_output is promoted from tool.result to
 	// command.result. A non-shell call's id never enters the set.
 	shellCallIDs map[string]struct{}
-	// codeModeShellCallIDs records custom exec cells that were safely reduced to
-	// one command.exec, so only their custom_tool_call_output becomes a
-	// command.result. Keeping the sets separate prevents cross-variant collisions.
-	codeModeShellCallIDs map[string]struct{}
+	// codeModeShellCalls records how a safely reduced exec cell forwarded its
+	// result, so the paired custom output is decoded without scraping stdout.
+	codeModeShellCalls map[string]codexCodeModeResultKind
 	// failedMCPCallIDs is the set of call_ids whose mcp_tool_call_end recorded a
 	// structured failure. A custom_tool_call_output emitted AFTER its end-event
 	// consults this so it still carries the tool-error signal regardless of the
@@ -117,24 +116,24 @@ func (st *codexState) isShellCall(id string) bool {
 	return ok
 }
 
-func (st *codexState) noteCodeModeShellCall(id string) {
+func (st *codexState) noteCodeModeShellCall(id string, resultKind codexCodeModeResultKind) {
 	if id == "" {
 		return
 	}
-	if st.codeModeShellCallIDs == nil {
-		st.codeModeShellCallIDs = map[string]struct{}{}
+	if st.codeModeShellCalls == nil {
+		st.codeModeShellCalls = map[string]codexCodeModeResultKind{}
 	}
-	st.codeModeShellCallIDs[id] = struct{}{}
+	st.codeModeShellCalls[id] = resultKind
 }
 
 func (st *codexState) forgetCodeModeShellCall(id string) {
-	delete(st.codeModeShellCallIDs, id)
+	delete(st.codeModeShellCalls, id)
 }
 
-func (st *codexState) takeCodeModeShellCall(id string) bool {
-	_, ok := st.codeModeShellCallIDs[id]
-	delete(st.codeModeShellCallIDs, id)
-	return ok
+func (st *codexState) takeCodeModeShellCall(id string) (codexCodeModeResultKind, bool) {
+	resultKind, ok := st.codeModeShellCalls[id]
+	delete(st.codeModeShellCalls, id)
+	return resultKind, ok
 }
 
 // Extract parses a Codex rollout file. It reads the whole artifact to stamp a
@@ -342,16 +341,16 @@ func (e CodexExtractor) mapResponseItem(res *Result, src Source, sha string, st 
 			return
 		}
 		if ri.Name == codexToolCodeModeExec {
-			if command, ok := codexCodeModeExecCommand(string(ri.Input)); ok {
+			if call, ok := parseCodexCodeModeExec(string(ri.Input)); ok {
 				ev := e.base(src, sha, st, line, ts, 0)
 				ev.Actor = model.ActorAssistant
 				ev.Confidence = model.ConfidenceHigh
 				ev.ToolName = codexToolExecCommand
 				ev.ToolCallID = ri.CallID
 				ev.EventType = model.EventCommandExec
-				ev.Command = command
+				ev.Command = call.command
 				ev.Evidence.JSONPointer = "/payload/input"
-				st.noteCodeModeShellCall(ri.CallID)
+				st.noteCodeModeShellCall(ri.CallID, call.resultKind)
 				res.Events = append(res.Events, ev)
 				return
 			}
@@ -389,38 +388,49 @@ func (e CodexExtractor) mapResponseItem(res *Result, src Source, sha string, st 
 		ev.Actor = model.ActorTool
 		ev.Confidence = model.ConfidenceHigh
 		ev.ToolCallID = ri.CallID
-		ev.ContentPreview = preview(decodeCodexOutput(ri.Output))
+		resultBody := decodeCodexOutput(ri.Output)
 		ev.Evidence.JSONPointer = "/payload/output"
 		// An output paired by call_id with the matching shell-call variant is a
 		// command.result. Other function/custom outputs stay tool.result.
 		//
-		// A shell command.result's ExitCode stays nil: Codex serializes a
-		// function_call_output as only its body (FunctionCallOutputPayload in
-		// protocol/src/models.rs drops the internal success flag and writes no
-		// structured exit code — the code appears only as a free-text
-		// "Exit code: N" line in the body, too brittle to lift), and the structured
-		// ExecCommandEnd carrying the real code is not persisted to the rollout. So
-		// there is no faithful structured shell exit status to attach, and numbat
-		// never scrapes the prose body for one. The shell tool-error signal is
-		// likewise unrecoverable at rest: local_shell_call's status enum is
-		// Completed|InProgress|Incomplete with no failure variant (Incomplete is an
-		// abort/limit, not a tool error). See
-		// TestExtractCodexShellResultHasNoStructuredExitOrError.
+		// Legacy shell outputs persist only prose, so their exit status remains
+		// unset. Current code-mode outputs can carry the exec helper's structured
+		// result; decode it only when the statically parsed cell forwarded that
+		// object, never by interpreting JSON-looking stdout.
 		//
 		// An MCP tool failure, by contrast, IS recoverable: the persisted
 		// mcp_tool_call_end carries a structured Result keyed by this call_id, and
 		// mapEventMsg stamps TagToolError on this tool.result when it records a
 		// failure. When the end-event already arrived (it preceded this output), the
 		// failure was recorded in state, so tag here too.
+		var codeModeResultKind codexCodeModeResultKind
+		var codeModeResult bool
+		if ri.Type == codexRICustomToolCallOut {
+			codeModeResultKind, codeModeResult = st.takeCodeModeShellCall(ri.CallID)
+		}
 		if (ri.Type == codexRIFunctionCallOutput && st.isShellCall(ri.CallID)) ||
-			(ri.Type == codexRICustomToolCallOut && st.takeCodeModeShellCall(ri.CallID)) {
+			(ri.Type == codexRICustomToolCallOut && codeModeResult) {
 			ev.EventType = model.EventCommandResult
+			if codeModeResult {
+				ev.ToolName = codexToolExecCommand
+				outcome := decodeCodexCodeModeOutcome(ri.Output, codeModeResultKind)
+				resultBody = outcome.output
+				ev.ExitCode = outcome.exitCode
+				ev.DurationMs = outcome.durationMs
+				if outcome.toolError {
+					ev.Tags = append(ev.Tags, model.TagToolError)
+				}
+				if !outcome.recognized {
+					res.diag(src.Path, line, "unrecognized code-mode result envelope")
+				}
+			}
 		} else {
 			ev.EventType = model.EventToolResult
 			if st.isFailedMCPCall(ri.CallID) {
 				ev.Tags = append(ev.Tags, model.TagToolError)
 			}
 		}
+		ev.ContentPreview = preview(resultBody)
 		res.Events = append(res.Events, ev)
 	case codexRIToolSearchOutput:
 		// The result of a tool_search_call (the model discovering which tools

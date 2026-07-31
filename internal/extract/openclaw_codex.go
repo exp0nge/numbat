@@ -23,9 +23,8 @@ import (
 // the matching tool.result TagToolError, and the no-twin state transitions
 // (turn_aborted / thread_rolled_back / review-mode / thread-goal) become
 // low-confidence system notes (see mapCodexEventMsg). Per the high-precision
-// boundary, NO shell exit code is emitted (Codex's function_call_output carries
-// no structured exit field — see codex.go) and a tool-error tag is set only from
-// a structured field.
+// boundary, legacy shell output never has its prose scraped for an exit code,
+// and a tool-error tag is set only from a structured field.
 
 // mapCodexLine decodes one Codex-flavor OpenClaw line and dispatches on the
 // outer record type. A malformed line is a diagnostic and is skipped; the rest of
@@ -119,13 +118,30 @@ func (e OpenClawExtractor) mapCodexResponseItem(res *Result, src Source, sha str
 		ev.Confidence = model.ConfidenceHigh
 		ev.ToolCallID = ri.CallID
 		ev.Evidence.JSONPointer = "/payload/output"
-		ev.ContentPreview = preview(decodeCodexOutput(ri.Output))
+		resultBody := decodeCodexOutput(ri.Output)
 		// An output paired with the matching shell-call variant is a
-		// command.result; every other output stays tool.result. No exit code is
-		// emitted because Codex does not persist one in these response items.
+		// command.result; every other output stays tool.result.
+		var codeModeResultKind codexCodeModeResultKind
+		var codeModeResult bool
+		if ri.Type == codexRICustomToolCallOut {
+			codeModeResultKind, codeModeResult = st.takeCodexCodeModeCommandCall(ri.CallID)
+		}
 		if (ri.Type == codexRIFunctionCallOutput && st.isCommandCall(ri.CallID)) ||
-			(ri.Type == codexRICustomToolCallOut && st.takeCodexCodeModeCommandCall(ri.CallID)) {
+			(ri.Type == codexRICustomToolCallOut && codeModeResult) {
 			ev.EventType = model.EventCommandResult
+			if codeModeResult {
+				ev.ToolName = codexToolExecCommand
+				outcome := decodeCodexCodeModeOutcome(ri.Output, codeModeResultKind)
+				resultBody = outcome.output
+				ev.ExitCode = outcome.exitCode
+				ev.DurationMs = outcome.durationMs
+				if outcome.toolError {
+					ev.Tags = append(ev.Tags, model.TagToolError)
+				}
+				if !outcome.recognized {
+					res.diag(src.Path, line, "unrecognized code-mode result envelope")
+				}
+			}
 		} else {
 			ev.EventType = model.EventToolResult
 			// An mcp_tool_call_end may have recorded this call's failure before its
@@ -135,6 +151,7 @@ func (e OpenClawExtractor) mapCodexResponseItem(res *Result, src Source, sha str
 				ev.Tags = append(ev.Tags, model.TagToolError)
 			}
 		}
+		ev.ContentPreview = preview(resultBody)
 		res.appendEvent(st, ev, true)
 	case codexRIWebSearchCall:
 		ev := e.base(src, sha, st, line, 0)
@@ -159,16 +176,16 @@ func (e OpenClawExtractor) mapCodexResponseItem(res *Result, src Source, sha str
 		// A later custom call reusing a malformed call id owns its next output.
 		st.forgetCodexCodeModeCommandCall(ri.CallID)
 		if ri.Name == codexToolCodeModeExec {
-			if command, ok := codexCodeModeExecCommand(string(ri.Input)); ok {
+			if call, ok := parseCodexCodeModeExec(string(ri.Input)); ok {
 				ev := e.base(src, sha, st, line, 0)
 				ev.Actor = model.ActorAssistant
 				ev.Confidence = model.ConfidenceHigh
 				ev.ToolName = codexToolExecCommand
 				ev.ToolCallID = ri.CallID
 				ev.EventType = model.EventCommandExec
-				ev.Command = command
+				ev.Command = call.command
 				ev.Evidence.JSONPointer = "/payload/input"
-				st.noteCodexCodeModeCommandCall(ri.CallID)
+				st.noteCodexCodeModeCommandCall(ri.CallID, call.resultKind)
 				res.appendEvent(st, ev, true)
 				return
 			}

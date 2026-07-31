@@ -2,6 +2,7 @@ package extract
 
 import (
 	"encoding/json"
+	"math"
 	"regexp"
 	"strings"
 )
@@ -13,29 +14,55 @@ var codexCodeModeExecPrefix = regexp.MustCompile(`^const[[:space:]]+([A-Za-z_$][
 
 const codexCodeModeStringToken = "<string>"
 
+type codexCodeModeResultKind uint8
+
+const (
+	codexCodeModeResultNone codexCodeModeResultKind = iota
+	codexCodeModeResultOutput
+	codexCodeModeResultObject
+)
+
+type codexCodeModeExec struct {
+	command    string
+	resultKind codexCodeModeResultKind
+}
+
+type codexCodeModeOutcome struct {
+	output     string
+	exitCode   *int
+	durationMs *int64
+	toolError  bool
+	recognized bool
+}
+
 func codexCodeModeExecCommand(input string) (string, bool) {
+	call, ok := parseCodexCodeModeExec(input)
+	return call.command, ok
+}
+
+func parseCodexCodeModeExec(input string) (codexCodeModeExec, bool) {
 	s := strings.TrimSpace(input)
 	if strings.HasPrefix(s, "// @exec:") {
 		newline := strings.IndexByte(s, '\n')
 		if newline < 0 {
-			return "", false
+			return codexCodeModeExec{}, false
 		}
 		s = strings.TrimSpace(s[newline+1:])
 	}
 
 	match := codexCodeModeExecPrefix.FindStringSubmatchIndex(s)
 	if match == nil || !isCodexCodeModeBindingName(s[match[2]:match[3]]) {
-		return "", false
+		return codexCodeModeExec{}, false
 	}
 	resultName := s[match[2]:match[3]]
 
 	command, end, ok := parseCodexCodeModeExecArgs(s, match[1])
 	if !ok {
-		return "", false
+		return codexCodeModeExec{}, false
 	}
 	end = skipASCIIWhitespace(s, end)
 	if end >= len(s) || s[end] != ')' {
-		return "", false
+		return codexCodeModeExec{}, false
 	}
 	end++
 	var lineBreak bool
@@ -46,39 +73,125 @@ func codexCodeModeExecCommand(input string) (string, bool) {
 		separated = true
 	}
 	if skipASCIIWhitespace(s, end) < len(s) && !separated {
-		return "", false
+		return codexCodeModeExec{}, false
 	}
 
 	// Accept only an empty tail or the common result-forwarding forms. Any other
 	// JavaScript may contain another operation or alter the meaning of the output.
-	if !isCodexCodeModeResultTail(s[end:], resultName) {
-		return "", false
+	resultKind, ok := codexCodeModeResultTail(s[end:], resultName)
+	if !ok {
+		return codexCodeModeExec{}, false
 	}
-	return command, true
+	return codexCodeModeExec{command: command, resultKind: resultKind}, true
 }
 
-func isCodexCodeModeResultTail(s, resultName string) bool {
+func codexCodeModeResultTail(s, resultName string) (codexCodeModeResultKind, bool) {
 	tokens, ok := codexCodeModeTailTokens(s)
 	if !ok {
-		return false
+		return codexCodeModeResultNone, false
 	}
 	if len(tokens) == 0 {
-		return true
+		return codexCodeModeResultNone, true
 	}
 	if tokens[len(tokens)-1] == ";" {
 		tokens = tokens[:len(tokens)-1]
 	}
 	// These declarations shadow helpers used by the corresponding tail shape.
 	if resultName == "text" {
-		return false
+		return codexCodeModeResultNone, false
 	}
-	if codexCodeModeTokensEqual(tokens, "text", "(", resultName, ")") ||
-		codexCodeModeTokensEqual(tokens, "text", "(", resultName, ".", "output", ")") ||
+	if codexCodeModeTokensEqual(tokens, "text", "(", resultName, ")") {
+		return codexCodeModeResultObject, true
+	}
+	if codexCodeModeTokensEqual(tokens, "text", "(", resultName, ".", "output", ")") ||
 		codexCodeModeTokensEqual(tokens, "text", "(", resultName, ".", "output", "||", codexCodeModeStringToken, ")") {
-		return true
+		return codexCodeModeResultOutput, true
 	}
-	return resultName != "JSON" && codexCodeModeTokensEqual(tokens,
-		"text", "(", "JSON", ".", "stringify", "(", resultName, ")", ")")
+	if resultName != "JSON" && codexCodeModeTokensEqual(tokens,
+		"text", "(", "JSON", ".", "stringify", "(", resultName, ")", ")") {
+		return codexCodeModeResultObject, true
+	}
+	return codexCodeModeResultNone, false
+}
+
+var (
+	codexCodeModeOutputEnvelope  = regexp.MustCompile(`^Script completed\nWall time [0-9]+(?:\.[0-9]+)? seconds\nOutput:\n$`)
+	codexCodeModeFailedEnvelope  = regexp.MustCompile(`^Script failed\nWall time [0-9]+(?:\.[0-9]+)? seconds\nOutput:\n$`)
+	codexCodeModeRunningEnvelope = regexp.MustCompile(`^Script running with cell ID [^\n]+\nWall time [0-9]+(?:\.[0-9]+)? seconds\nOutput:\n`)
+)
+
+func decodeCodexCodeModeOutput(raw json.RawMessage) (string, bool) {
+	return decodeCodexCodeModeEnvelope(raw, codexCodeModeOutputEnvelope)
+}
+
+func decodeCodexCodeModeEnvelope(raw json.RawMessage, envelope *regexp.Regexp) (string, bool) {
+	var items []codexContentItem
+	if json.Unmarshal(raw, &items) != nil || len(items) != 2 ||
+		items[0].Type != "input_text" || items[1].Type != "input_text" ||
+		!envelope.MatchString(items[0].Text) {
+		return "", false
+	}
+	return items[1].Text, true
+}
+
+func decodeCodexCodeModeOutcome(raw json.RawMessage, kind codexCodeModeResultKind) codexCodeModeOutcome {
+	outcome := codexCodeModeOutcome{
+		output:     decodeCodexOutput(raw),
+		recognized: kind != codexCodeModeResultObject,
+	}
+	if body, ok := decodeCodexCodeModeEnvelope(raw, codexCodeModeFailedEnvelope); ok {
+		outcome.output = body
+		outcome.toolError = true
+		outcome.recognized = true
+		return outcome
+	}
+	if body, ok := decodeCodexCodeModeOutput(raw); ok {
+		outcome.output = body
+	}
+	if kind != codexCodeModeResultObject {
+		return outcome
+	}
+	if isCodexCodeModeRunningOutput(raw) {
+		outcome.recognized = true
+		return outcome
+	}
+
+	body, exitCode, durationMs, ok := decodeCodexCodeModeResultObject(raw)
+	if !ok {
+		return outcome
+	}
+	outcome.output = body
+	outcome.exitCode = exitCode
+	outcome.durationMs = durationMs
+	outcome.toolError = exitCode != nil && *exitCode != 0
+	outcome.recognized = true
+	return outcome
+}
+
+func decodeCodexCodeModeResultObject(raw json.RawMessage) (output string, exitCode *int, durationMs *int64, ok bool) {
+	body, ok := decodeCodexCodeModeOutput(raw)
+	if !ok {
+		return "", nil, nil, false
+	}
+	var result struct {
+		ExitCode        *int     `json:"exit_code"`
+		Output          *string  `json:"output"`
+		WallTimeSeconds *float64 `json:"wall_time_seconds"`
+	}
+	if json.Unmarshal([]byte(body), &result) != nil || result.Output == nil {
+		return "", nil, nil, false
+	}
+	if result.ExitCode != nil && result.WallTimeSeconds != nil &&
+		*result.WallTimeSeconds >= 0 && *result.WallTimeSeconds < float64(math.MaxInt64/1000) {
+		milliseconds := int64(math.Round(*result.WallTimeSeconds * 1000))
+		durationMs = &milliseconds
+	}
+	return *result.Output, result.ExitCode, durationMs, true
+}
+
+func isCodexCodeModeRunningOutput(raw json.RawMessage) bool {
+	var output string
+	return json.Unmarshal(raw, &output) == nil && codexCodeModeRunningEnvelope.MatchString(output)
 }
 
 func codexCodeModeTailTokens(s string) ([]string, bool) {

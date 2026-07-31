@@ -834,11 +834,11 @@ func TestOpenClawCodexResponseItemParity(t *testing.T) {
 }
 
 func TestOpenClawEmbeddedCodexCodeModeParity(t *testing.T) {
-	input := `const r = await tools.exec_command({cmd:"git status", workdir:"/w"}); text(r.output);`
+	input := `const r = await tools.exec_command({cmd:"git status", workdir:"/w"}); text(r);`
 	lines := []string{
 		`{"timestamp":"t","type":"session_meta","payload":{"id":"cx-code","cwd":"/w"}}`,
 		`{"timestamp":"t","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"code1","input":` + jsonString(input) + `}}`,
-		`{"timestamp":"t","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"code1","output":"clean"}}`,
+		`{"timestamp":"t","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"code1","output":[{"type":"input_text","text":"Script completed\nWall time 0.1 seconds\nOutput:\n"},{"type":"input_text","text":"{\"exit_code\":3,\"wall_time_seconds\":0.012,\"output\":\"failed\\n\"}"}]}}`,
 	}
 	res := extractOpenClaw(t, strings.Join(lines, "\n"))
 	if len(res.Events) != 2 {
@@ -848,7 +848,10 @@ func TestOpenClawEmbeddedCodexCodeModeParity(t *testing.T) {
 	if call.EventType != model.EventCommandExec || call.ToolName != codexToolExecCommand || call.Command != "git status" {
 		t.Errorf("call = %+v, want code-mode command.exec", call)
 	}
-	if result.EventType != model.EventCommandResult || result.ToolCallID != "code1" || result.ContentPreview != "clean" {
+	if result.EventType != model.EventCommandResult || result.ToolCallID != "code1" ||
+		result.ToolName != codexToolExecCommand || result.ContentPreview != "failed" ||
+		result.ExitCode == nil || *result.ExitCode != 3 || result.DurationMs == nil ||
+		*result.DurationMs != 12 || !hasTag(result.Tags, model.TagToolError) {
 		t.Errorf("result = %+v, want correlated command.result with preview", result)
 	}
 	assertOpenClawPointersResolve(t, res, lines)
