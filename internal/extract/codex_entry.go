@@ -85,6 +85,7 @@ const (
 	codexToolReadFile     = "read_file"
 	codexToolWriteFile    = "create_file"
 	codexToolEditFile     = "edit_file"
+	codexToolCodeModeExec = "exec"
 	codexToolUpdatePlan   = "update_plan"
 	codexToolSearch       = "tool_search"
 	codexToolImage        = "image_generation"

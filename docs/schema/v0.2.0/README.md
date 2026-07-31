@@ -22,6 +22,13 @@ The schemas describe the emitted wire shape. They do not change runtime
 behavior. They keep numbat's flat event model: rules evaluate the same field
 names that records emit.
 
+Action event types are alternatives, not layers. A recognized shell, file, or
+network tool action uses `command.exec`, `file.*`, or `network.indicator`
+instead of an additional `tool.call`; `tool.call` is the fallback. When a
+source provides a separate outcome, shell outcomes use `command.result` and
+other outcomes use `tool.result`. A structured multi-file edit may expand to
+one file event per affected path.
+
 When findings are selected, a matched, enforce-capable pre-action hook also
 emits an `enforcement` record with numbat's computed `deny` or `no_override`
 decision. It joins to rule matches and the proposed action through

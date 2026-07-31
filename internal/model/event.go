@@ -246,7 +246,7 @@ type Event struct {
 	FilePath string `json:"file_path,omitempty"`
 	Decision string `json:"decision,omitempty"`
 
-	// ToolCallID correlates a tool.call with its later tool.result/command.result
+	// ToolCallID correlates a generic or specialized action with its later result
 	// when the artifact assigns one (Claude tool_use id, Codex call_id).
 	ToolCallID string `json:"tool_call_id,omitempty"`
 
