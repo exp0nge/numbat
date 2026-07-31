@@ -65,6 +65,19 @@ const (
 	EvidenceRedacted
 )
 
+func (m EvidenceMode) String() string {
+	switch m {
+	case EvidenceNone:
+		return "none"
+	case EvidenceRaw:
+		return "raw"
+	case EvidenceRedacted:
+		return "redacted"
+	default:
+		return ""
+	}
+}
+
 // Options configures one bundle build.
 type Options struct {
 	// CaseID selects the findings to bundle (their case_id field).
@@ -119,6 +132,7 @@ type Manifest struct {
 	CreatedAt     string         `json:"created_at"`
 	Tool          string         `json:"tool"`
 	ToolVersion   string         `json:"tool_version"`
+	EvidenceMode  string         `json:"evidence_mode"`
 	Files         []ManifestFile `json:"files"`
 }
 
@@ -131,6 +145,8 @@ type ManifestFile struct {
 	Records int `json:"records,omitempty"`
 	// SourcePath is the local path an evidence copy was taken from.
 	SourcePath string `json:"source_path,omitempty"`
+	// SourceSHA256 hashes the source bytes before any redaction.
+	SourceSHA256 string `json:"source_sha256,omitempty"`
 }
 
 // manifestName is the one non-record file every bundle carries.
@@ -700,11 +716,14 @@ func copyOneEvidence(evDir, src string, mode EvidenceMode) (ManifestFile, string
 		_ = os.Remove(filepath.Join(evDir, name))
 		return ManifestFile{}, "", copyErr
 	}
+	outputSHA256 := hex.EncodeToString(outputHash.Sum(nil))
+	sourceSHA256 := hex.EncodeToString(sourceHash.Sum(nil))
 	return ManifestFile{
-		Path:       "evidence/" + name,
-		SHA256:     hex.EncodeToString(outputHash.Sum(nil)),
-		SourcePath: src,
-	}, hex.EncodeToString(sourceHash.Sum(nil)), nil
+		Path:         "evidence/" + name,
+		SHA256:       outputSHA256,
+		SourcePath:   src,
+		SourceSHA256: sourceSHA256,
+	}, sourceSHA256, nil
 }
 
 func evidenceCopyName(src string) string {
@@ -909,6 +928,7 @@ func writeManifest(opts Options, files []ManifestFile) error {
 		CreatedAt:     now.UTC().Format(time.RFC3339Nano),
 		Tool:          model.ToolName,
 		ToolVersion:   version.String(),
+		EvidenceMode:  opts.Evidence.String(),
 		Files:         files,
 	}
 	b, err := json.MarshalIndent(m, "", "  ")

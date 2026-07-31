@@ -758,9 +758,11 @@ cited event records, the build succeeds
 with an incomplete-events warning; capture `--emit all` when the bundle should
 contain both. Inputs use the current record schema; other schema versions are
 skipped with a warning, and a source line that reaches the 8 MiB input cap fails
-the build. The
-manifest also records the build time. `case verify` is an integrity check, not a
-re-scan: it re-hashes a bundle against its manifest
+the build. The manifest records the build time and `evidence_mode` (`none`,
+`raw`, or `redacted`). Evidence entries carry separate hashes for the source
+bytes at copy time and the bytes stored in the bundle, so a redacted copy is
+never mistaken for the original artifact. `case verify` is an integrity check,
+not a re-scan: it re-hashes a bundle against its manifest
 — every listed file must match its digest, record files must match their record
 counts, and nothing unlisted may be present — but it never re-runs rules.
 

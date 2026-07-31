@@ -145,6 +145,11 @@ func validateManifest(m Manifest) []string {
 	if strings.TrimSpace(m.ToolVersion) == "" {
 		problems = append(problems, "manifest: empty tool_version")
 	}
+	switch m.EvidenceMode {
+	case "", "none", "raw", "redacted":
+	default:
+		problems = append(problems, fmt.Sprintf("manifest: invalid evidence_mode %q", m.EvidenceMode))
+	}
 	if _, err := time.Parse(time.RFC3339Nano, m.CreatedAt); err != nil {
 		problems = append(problems, fmt.Sprintf("manifest: invalid created_at %q", m.CreatedAt))
 	}
@@ -161,6 +166,22 @@ func validateManifest(m Manifest) []string {
 	for _, mf := range files {
 		if mf.Path == "findings.ndjson" || mf.Path == "events.ndjson" {
 			present[mf.Path] = true
+		}
+		if isEvidenceFile(mf.Path) {
+			switch m.EvidenceMode {
+			case "none":
+				problems = append(problems, fmt.Sprintf("manifest: evidence_mode none cannot list %q", mf.Path))
+			case "raw", "redacted":
+				if mf.SourcePath == "" {
+					problems = append(problems, fmt.Sprintf("%s: empty source_path", mf.Path))
+				}
+				if mf.SourceSHA256 == "" {
+					problems = append(problems, fmt.Sprintf("%s: empty source_sha256", mf.Path))
+				}
+				if m.EvidenceMode == "raw" && isLowerHex64(mf.SourceSHA256) && mf.SourceSHA256 != mf.SHA256 {
+					problems = append(problems, fmt.Sprintf("%s: raw evidence source_sha256 does not match sha256", mf.Path))
+				}
+			}
 		}
 		if _, ok := seen[mf.Path]; ok {
 			problems = append(problems, fmt.Sprintf("manifest: duplicate path %q", mf.Path))
@@ -185,9 +206,7 @@ func validateManifestFile(mf ManifestFile) []string {
 		problems = append(problems, fmt.Sprintf("%s: rejected: %v", label, err))
 		return problems
 	}
-	isEvidence := strings.HasPrefix(mf.Path, "evidence/") &&
-		strings.TrimPrefix(mf.Path, "evidence/") != "" &&
-		!strings.Contains(strings.TrimPrefix(mf.Path, "evidence/"), "/")
+	isEvidence := isEvidenceFile(mf.Path)
 	if !isRecordFile(mf.Path) && !isEvidence {
 		problems = append(problems, fmt.Sprintf("%s: unexpected bundle path", mf.Path))
 	}
@@ -203,10 +222,18 @@ func validateManifestFile(mf ManifestFile) []string {
 	if isEvidence && mf.Records != 0 {
 		problems = append(problems, fmt.Sprintf("%s: evidence file cannot have a record count", mf.Path))
 	}
-	if isRecordFile(mf.Path) && mf.SourcePath != "" {
-		problems = append(problems, fmt.Sprintf("%s: record file cannot have source_path", mf.Path))
+	if isEvidence && mf.SourceSHA256 != "" && !isLowerHex64(mf.SourceSHA256) {
+		problems = append(problems, fmt.Sprintf("%s: invalid source_sha256", mf.Path))
+	}
+	if isRecordFile(mf.Path) && (mf.SourcePath != "" || mf.SourceSHA256 != "") {
+		problems = append(problems, fmt.Sprintf("%s: record file cannot have source metadata", mf.Path))
 	}
 	return problems
+}
+
+func isEvidenceFile(name string) bool {
+	rel := strings.TrimPrefix(name, "evidence/")
+	return rel != name && rel != "" && !strings.Contains(rel, "/")
 }
 
 func isLowerHex64(s string) bool {

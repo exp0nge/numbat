@@ -168,7 +168,7 @@ func TestBuildBundleShape(t *testing.T) {
 	if err := json.Unmarshal(b, &m); err != nil {
 		t.Fatal(err)
 	}
-	if m.CaseID != "case-1" || m.SchemaVersion != "0.2.0" || m.Tool != "numbat" || m.ToolVersion == "" {
+	if m.CaseID != "case-1" || m.SchemaVersion != "0.2.0" || m.Tool != "numbat" || m.ToolVersion == "" || m.EvidenceMode != "none" {
 		t.Fatalf("manifest = %+v", m)
 	}
 	if m.CreatedAt != "2026-06-10T12:00:00Z" {
@@ -848,8 +848,14 @@ func TestEvidenceRawCopy(t *testing.T) {
 			ev = &m.Files[i]
 		}
 	}
+	if m.EvidenceMode != "raw" {
+		t.Fatalf("evidence_mode = %q, want raw", m.EvidenceMode)
+	}
 	if ev == nil || ev.SourcePath != artifact || !strings.HasSuffix(ev.Path, "-session.jsonl") {
 		t.Fatalf("evidence manifest entry = %+v", ev)
+	}
+	if ev.SourceSHA256 != sha256StringHex(content) || ev.SHA256 != ev.SourceSHA256 {
+		t.Fatalf("raw evidence hashes = stored %q source %q", ev.SHA256, ev.SourceSHA256)
 	}
 	copied, err := os.ReadFile(filepath.Join(opts.Out, filepath.FromSlash(ev.Path)))
 	if err != nil {
@@ -966,7 +972,8 @@ func TestEvidenceCopyRejectsSymlinkSources(t *testing.T) {
 func TestEvidenceRedactedCopyMasksSecrets(t *testing.T) {
 	artifact := filepath.Join(t.TempDir(), "session.log")
 	secret := "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789"
-	if err := os.WriteFile(artifact, []byte("before\n"+secret+"\nafter\n"), 0o600); err != nil {
+	source := "before\n" + secret + "\nafter\n"
+	if err := os.WriteFile(artifact, []byte(source), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	opts := buildOpts(evidenceStream(t, artifact, ""))
@@ -987,6 +994,26 @@ func TestEvidenceRedactedCopyMasksSecrets(t *testing.T) {
 	}
 	if !strings.Contains(string(copied), "before\n") || !strings.Contains(string(copied), "after\n") {
 		t.Fatalf("redacted copy lost benign lines: %q", copied)
+	}
+	var m Manifest
+	manifest, err := os.ReadFile(filepath.Join(opts.Out, manifestName))
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	if err := json.Unmarshal(manifest, &m); err != nil {
+		t.Fatalf("parse manifest: %v", err)
+	}
+	if m.EvidenceMode != "redacted" {
+		t.Fatalf("evidence_mode = %q, want redacted", m.EvidenceMode)
+	}
+	var evidence ManifestFile
+	for _, mf := range m.Files {
+		if strings.HasPrefix(mf.Path, "evidence/") {
+			evidence = mf
+		}
+	}
+	if evidence.SourceSHA256 != sha256StringHex(source) || evidence.SHA256 == evidence.SourceSHA256 {
+		t.Fatalf("redacted evidence hashes = stored %q source %q", evidence.SHA256, evidence.SourceSHA256)
 	}
 	if v, err := Verify(opts.Out); err != nil || !v.OK() {
 		t.Fatalf("redacted bundle must verify: %+v, %v", v, err)
