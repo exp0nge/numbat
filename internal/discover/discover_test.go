@@ -1515,10 +1515,12 @@ func TestClassifyOpenCode(t *testing.T) {
 	}{
 		{"current part file", filepath.Join(".local", "share", "opencode", "storage", "part", "msg1", "prt1.json"), true, model.AgentOpenCode},
 		{"current message file", filepath.Join(".local", "share", "opencode", "storage", "message", "s1", "m1.json"), true, model.AgentOpenCode},
-		{"current session file", filepath.Join(".local", "share", "opencode", "storage", "session", "proj1", "s1.json"), true, model.AgentOpenCode},
+		{"session metadata", filepath.Join(".local", "share", "opencode", "storage", "session", "proj1", "s1.json"), false, ""},
+		{"session diff metadata", filepath.Join(".local", "share", "opencode", "storage", "session_diff", "s1.json"), false, ""},
 		{"git-project slug layout", filepath.Join(".local", "share", "opencode", "project", "myproj", "storage", "part", "m", "p.json"), true, model.AgentOpenCode},
 		{"global layout", filepath.Join(".local", "share", "opencode", "project", "global", "storage", "message", "s", "m.json"), true, model.AgentOpenCode},
 		{"legacy session/part layout", filepath.Join(".local", "share", "opencode", "storage", "session", "part", "msg1", "item", "p.json"), true, model.AgentOpenCode},
+		{"legacy project session/message layout", filepath.Join(".local", "share", "opencode", "project", "myproj", "storage", "session", "message", "s1", "m1.json"), true, model.AgentOpenCode},
 		{"case-insensitive extension", filepath.Join(".local", "share", "opencode", "storage", "part", "m", "p.JSON"), true, model.AgentOpenCode},
 		{"non-json under storage ignored", filepath.Join(".local", "share", "opencode", "storage", "part", "m", "p.txt"), false, ""},
 		// A .json under opencode/ but OUTSIDE storage/ is config/auth/cache, not a
@@ -1575,8 +1577,12 @@ func TestWalkClassifiesOpenCodeRelativeRoot(t *testing.T) {
 func TestWalkClassifiesOpenCodeAbsoluteRoot(t *testing.T) {
 	root := t.TempDir()
 	record := filepath.Join(root, ".local", "share", "opencode", "storage", "part", "m1", "p1.json")
+	session := filepath.Join(root, ".local", "share", "opencode", "storage", "session", "project", "s1.json")
+	diff := filepath.Join(root, ".local", "share", "opencode", "storage", "session_diff", "s1.json")
 	config := filepath.Join(root, ".config", "opencode", "opencode.json")
 	mkfile(t, record, "{}")
+	mkfile(t, session, "{}")
+	mkfile(t, diff, "[]")
 	mkfile(t, config, "{}")
 
 	arts, skips, err := Walk(root)

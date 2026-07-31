@@ -110,9 +110,8 @@ const (
 // OpenCode's earlier file stores use one JSON object per record. Current
 // releases may use opencode.db, which numbat does not classify as an artifact.
 const (
-	opencodeDataDir              = ".local/share/opencode"
-	opencodeStorageMarker        = "opencode/storage"
-	opencodeProjectStorageMarker = "opencode/project"
+	opencodeDataDir       = ".local/share/opencode"
+	opencodeStorageMarker = "opencode/storage"
 )
 
 const (
@@ -677,24 +676,37 @@ func underGeminiRoot(path string) bool {
 		strings.HasPrefix(slashed, geminiRootMarker+"/")
 }
 
-// isOpenCodeArtifact matches both retained per-record JSON layouts:
-// opencode/storage and the older opencode/project/<project>/storage.
+// isOpenCodeArtifact matches message and part records in both retained JSON
+// layouts: opencode/storage and the older opencode/project/<project>/storage.
 func isOpenCodeArtifact(path string) bool {
 	if !strings.EqualFold(filepath.Ext(path), ".json") {
 		return false
 	}
-	slashed := slashIdentity(path)
-	if strings.Contains(slashed, "/"+opencodeStorageMarker+"/") ||
-		strings.HasPrefix(slashed, opencodeStorageMarker+"/") {
-		return true
-	}
-	for _, marker := range []string{"/" + opencodeProjectStorageMarker + "/", opencodeProjectStorageMarker + "/"} {
-		if i := strings.Index(slashed, marker); i >= 0 {
-			rel := slashed[i+len(marker):]
-			return strings.Index(rel, "/storage/") > 0
+	segments := strings.Split(slashIdentity(path), "/")
+	for i, segment := range segments {
+		if segment != "opencode" || i+1 >= len(segments) {
+			continue
+		}
+		if segments[i+1] == "storage" && isOpenCodeRecordTail(segments[i+2:]) {
+			return true
+		}
+		if segments[i+1] == "project" && i+3 < len(segments) &&
+			segments[i+2] != "" && segments[i+3] == "storage" {
+			return isOpenCodeRecordTail(segments[i+4:])
 		}
 	}
 	return false
+}
+
+func isOpenCodeRecordTail(segments []string) bool {
+	if len(segments) < 2 {
+		return false
+	}
+	if segments[0] == "part" || segments[0] == "message" {
+		return true
+	}
+	return len(segments) >= 3 && segments[0] == "session" &&
+		(segments[1] == "part" || segments[1] == "message")
 }
 
 // isOpenClawArtifact validates OpenClaw's three session layouts rather than a
