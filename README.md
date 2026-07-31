@@ -267,6 +267,8 @@ reference: [docs/cli.md](docs/cli.md).
 
 - [Agent coverage](docs/agent-coverage.md): supported artifacts, live capture,
   enforcement, and known gaps.
+- [Event model](docs/event-model.md): normalization, action types, correlation,
+  and MCP fields.
 - [CLI reference](docs/cli.md): commands, flags, records, sinks, and exit codes.
 - [Live capture](docs/live-capture.md): hook and OTLP setup.
 - [Deployment](docs/deployment.md): install scope, trust, fleet rollout, and

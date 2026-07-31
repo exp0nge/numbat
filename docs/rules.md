@@ -1,8 +1,8 @@
 # Writing rules
 
 Each numbat rule is one YAML file with [CEL](https://cel.dev/) boolean
-expressions. It evaluates either one normalized event or an ordered sequence
-of events.
+expressions. It evaluates either one [normalized event](event-model.md) or an
+ordered sequence of events.
 
 Rule expressions can use:
 

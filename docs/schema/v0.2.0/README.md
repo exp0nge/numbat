@@ -19,8 +19,8 @@ Every emitted line carries an `endpoint` object with `hostname`, `os`, `arch`,
 `endpoint.device_id` for fleet joins.
 
 The schemas describe the emitted wire shape. They do not change runtime
-behavior. They keep numbat's flat event model: rules evaluate the same field
-names that records emit.
+behavior. They keep numbat's flat [event model](../../event-model.md): rules
+evaluate the same field names that records emit.
 
 Action event types are alternatives, not layers. A recognized shell, file, or
 network tool action uses `command.exec`, `file.*`, or `network.indicator`
