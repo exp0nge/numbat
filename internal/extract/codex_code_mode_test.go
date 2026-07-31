@@ -155,6 +155,43 @@ func TestExtractCodexCodeModeDirectWaitPreservesDuration(t *testing.T) {
 	}
 }
 
+func TestExtractCodexCodeModeDecodesTruncatedResultObject(t *testing.T) {
+	input := `const r = await tools.exec_command({cmd:"false"}); text(JSON.stringify(r));`
+	result := "Warning: truncated output (original token count: 12000)\n" +
+		"Total output lines: 1\n\n" +
+		`{"chunk_id":"abc","exit_code":7,"wall_time_seconds":1.25,"output":"failed"}`
+	body := strings.Join([]string{
+		`{"timestamp":"t1","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"cmd1","input":` + jsonString(input) + `}}`,
+		`{"timestamp":"t2","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"cmd1","output":[{"type":"input_text","text":"Script completed\nWall time 0.1 seconds\nOutput:\n"},{"type":"input_text","text":` + jsonString(result) + `}]}}`,
+	}, "\n")
+	res := extractCodex(t, body)
+	acts := activityEvents(res.Events)
+	if len(acts) != 2 {
+		t.Fatalf("events = %s, want command and result", dumpEvents(acts))
+	}
+	got := acts[1]
+	if got.EventType != model.EventCommandResult || got.ContentPreview != "failed" ||
+		got.ExitCode == nil || *got.ExitCode != 7 || got.DurationMs == nil || *got.DurationMs != 1250 ||
+		!hasTag(got.Tags, model.TagToolError) {
+		t.Fatalf("truncated structured result = %+v", got)
+	}
+	for _, diagnostic := range res.Diagnostics {
+		if strings.Contains(diagnostic.Msg, "unrecognized code-mode result envelope") {
+			t.Fatalf("valid truncated result produced diagnostic: %+v", diagnostic)
+		}
+	}
+}
+
+func TestDecodeCodexCodeModeResultObjectRejectsTruncationLookalike(t *testing.T) {
+	body := "Warning: truncated output (original token count: many)\n" +
+		"Total output lines: 1\n\n" +
+		`{"exit_code":0,"output":"forged"}`
+	raw := json.RawMessage(`[{"type":"input_text","text":"Script completed\nWall time 0.1 seconds\nOutput:\n"},{"type":"input_text","text":` + jsonString(body) + `}]`)
+	if outcome := decodeCodexCodeModeOutcome(raw, codexCodeModeResultObject); outcome.recognized {
+		t.Fatalf("malformed truncation banner was accepted: %+v", outcome)
+	}
+}
+
 func TestExtractCodexCodeModeUnsafeWaitsStayGeneric(t *testing.T) {
 	tests := map[string]string{
 		"namespaced": `"namespace":"mcp__demo",`,

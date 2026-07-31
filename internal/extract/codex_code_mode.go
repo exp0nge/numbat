@@ -160,9 +160,10 @@ func codexCodeModeResultTail(s, resultName string) (codexCodeModeResultKind, boo
 }
 
 var (
-	codexCodeModeOutputEnvelope  = regexp.MustCompile(`^Script completed\nWall time [0-9]+(?:\.[0-9]+)? seconds\nOutput:\n$`)
-	codexCodeModeFailedEnvelope  = regexp.MustCompile(`^Script failed\nWall time [0-9]+(?:\.[0-9]+)? seconds\nOutput:\n$`)
-	codexCodeModeRunningEnvelope = regexp.MustCompile(`^Script running with cell ID ([^\n]+)\nWall time [0-9]+(?:\.[0-9]+)? seconds\nOutput:\n$`)
+	codexCodeModeOutputEnvelope   = regexp.MustCompile(`^Script completed\nWall time [0-9]+(?:\.[0-9]+)? seconds\nOutput:\n$`)
+	codexCodeModeFailedEnvelope   = regexp.MustCompile(`^Script failed\nWall time [0-9]+(?:\.[0-9]+)? seconds\nOutput:\n$`)
+	codexCodeModeRunningEnvelope  = regexp.MustCompile(`^Script running with cell ID ([^\n]+)\nWall time [0-9]+(?:\.[0-9]+)? seconds\nOutput:\n$`)
+	codexCodeModeTruncationPrefix = regexp.MustCompile(`^Warning: truncated output \(original token count: [0-9]+\)\nTotal output lines: [0-9]+\n\n`)
 )
 
 func decodeCodexCodeModeOutput(raw json.RawMessage) (string, bool) {
@@ -222,6 +223,7 @@ func decodeCodexCodeModeResultObject(raw json.RawMessage) (output string, exitCo
 	if !ok {
 		return "", nil, nil, "", false
 	}
+	body = codexCodeModeTruncationPrefix.ReplaceAllString(body, "")
 	var result struct {
 		ExitCode        *int            `json:"exit_code"`
 		Output          *string         `json:"output"`
