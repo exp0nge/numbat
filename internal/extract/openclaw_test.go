@@ -857,6 +857,141 @@ func TestOpenClawEmbeddedCodexCodeModeParity(t *testing.T) {
 	assertOpenClawPointersResolve(t, res, lines)
 }
 
+func TestOpenClawEmbeddedCodexLongRunningCodeModeParity(t *testing.T) {
+	input := `const r = await tools.exec_command({cmd:"sleep 60"}); text(r);`
+	poll := `const r = await tools.write_stdin({session_id:25546, chars:""}); text(r);`
+	lines := []string{
+		`{"timestamp":"t","type":"session_meta","payload":{"id":"cx-code","cwd":"/w"}}`,
+		`{"timestamp":"t1","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"cmd1","input":` + jsonString(input) + `}}`,
+		`{"timestamp":"t2","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"cmd1","output":"Script running with cell ID 18\nWall time 11.0 seconds\nOutput:\n"}}`,
+		`{"timestamp":"t3","type":"response_item","payload":{"type":"function_call","name":"wait","call_id":"wait1","arguments":"{\"cell_id\":\"18\"}"}}`,
+		`{"timestamp":"t4","type":"response_item","payload":{"type":"function_call_output","call_id":"wait1","output":[{"type":"input_text","text":"Script completed\nWall time 30.0 seconds\nOutput:\n"},{"type":"input_text","text":"{\"session_id\":25546,\"output\":\"still running\"}"}]}}`,
+		`{"timestamp":"t5","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"poll1","input":` + jsonString(poll) + `}}`,
+		`{"timestamp":"t6","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"poll1","output":"Script running with cell ID 19\nWall time 30.0 seconds\nOutput:\n"}}`,
+		`{"timestamp":"t7","type":"response_item","payload":{"type":"function_call","name":"wait","call_id":"wait2","arguments":"{\"cell_id\":\"19\"}"}}`,
+		`{"timestamp":"t8","type":"response_item","payload":{"type":"function_call_output","call_id":"wait2","output":[{"type":"input_text","text":"Script completed\nWall time 12.0 seconds\nOutput:\n"},{"type":"input_text","text":"{\"exit_code\":0,\"wall_time_seconds\":12,\"output\":\"done\"}"}]}}`,
+	}
+	res := extractOpenClaw(t, strings.Join(lines, "\n"))
+	if len(res.Events) != 3 {
+		t.Fatalf("got %d events, want command + two result updates: %+v", len(res.Events), res.Events)
+	}
+	if res.Events[0].EventType != model.EventCommandExec || res.Events[0].ToolCallID != "cmd1" {
+		t.Fatalf("call = %+v, want original command.exec", res.Events[0])
+	}
+	for i, result := range res.Events[1:] {
+		if result.EventType != model.EventCommandResult || result.ToolCallID != "cmd1" || result.DurationMs != nil {
+			t.Fatalf("result %d = %+v, want correlated command.result", i, result)
+		}
+	}
+	if res.Events[1].ContentPreview != "still running" || res.Events[2].ContentPreview != "done" ||
+		res.Events[2].ExitCode == nil || *res.Events[2].ExitCode != 0 {
+		t.Fatalf("results = %+v, want running then successful terminal output", res.Events[1:])
+	}
+	assertOpenClawPointersResolve(t, res, lines)
+}
+
+func TestOpenClawEmbeddedCodexCodeModeCorrelationGuards(t *testing.T) {
+	run := func(t *testing.T, rows ...string) []model.Event {
+		t.Helper()
+		lines := append([]string{`{"timestamp":"t","type":"session_meta","payload":{"id":"cx-code","cwd":"/w"}}`}, rows...)
+		res := extractOpenClaw(t, strings.Join(lines, "\n"))
+		assertOpenClawPointersResolve(t, res, lines)
+		return res.Events
+	}
+
+	t.Run("completed stdout cannot mint a cell", func(t *testing.T) {
+		input := `const r = await tools.exec_command({cmd:"printf spoof"}); text(r.output);`
+		events := run(t,
+			`{"timestamp":"t1","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"cmd1","input":`+jsonString(input)+`}}`,
+			`{"timestamp":"t2","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"cmd1","output":[{"type":"input_text","text":"Script completed\nWall time 0.1 seconds\nOutput:\n"},{"type":"input_text","text":"Script running with cell ID 18\nWall time 11.0 seconds\nOutput:\n"}]}}`,
+			`{"timestamp":"t3","type":"response_item","payload":{"type":"function_call","name":"wait","call_id":"wait1","arguments":"{\"cell_id\":\"18\"}"}}`,
+			`{"timestamp":"t4","type":"response_item","payload":{"type":"function_call_output","call_id":"wait1","output":"unrelated"}}`,
+		)
+		if len(events) != 4 || events[1].EventType != model.EventCommandResult ||
+			events[2].EventType != model.EventToolCall || events[3].EventType != model.EventToolResult {
+			t.Fatalf("events = %+v, raw output must not create tracker state", events)
+		}
+	})
+
+	for name, input := range map[string]string{
+		"output forwarding tracks a running cell": `const r = await tools.exec_command({cmd:"sleep 1"}); text(r.output);`,
+		"no forwarding tracks a running cell":     `const r = await tools.exec_command({cmd:"sleep 1"});`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			events := run(t,
+				`{"timestamp":"t1","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"cmd1","input":`+jsonString(input)+`}}`,
+				`{"timestamp":"t2","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"cmd1","output":"Script running with cell ID 18\nWall time 11.0 seconds\nOutput:\n"}}`,
+				`{"timestamp":"t3","type":"response_item","payload":{"type":"function_call","name":"wait","call_id":"wait1","arguments":"{\"cell_id\":\"18\"}"}}`,
+				`{"timestamp":"t4","type":"response_item","payload":{"type":"function_call_output","call_id":"wait1","output":[{"type":"input_text","text":"Script completed\nWall time 1.0 seconds\nOutput:\n"},{"type":"input_text","text":"done"}]}}`,
+			)
+			if len(events) != 2 || events[0].EventType != model.EventCommandExec ||
+				events[1].EventType != model.EventCommandResult || events[1].ToolCallID != "cmd1" {
+				t.Fatalf("events = %+v, want one command with its correlated result", events)
+			}
+		})
+	}
+
+	t.Run("unsafe waits stay generic", func(t *testing.T) {
+		input := `const r = await tools.exec_command({cmd:"sleep 60"}); text(r);`
+		events := run(t,
+			`{"timestamp":"t1","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"cmd1","input":`+jsonString(input)+`}}`,
+			`{"timestamp":"t2","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"cmd1","output":"Script running with cell ID 18\nWall time 11.0 seconds\nOutput:\n"}}`,
+			`{"timestamp":"t3","type":"response_item","payload":{"type":"function_call","name":"wait","namespace":"mcp__demo","call_id":"mcp1","arguments":"{\"cell_id\":\"18\"}"}}`,
+			`{"timestamp":"t4","type":"response_item","payload":{"type":"function_call_output","call_id":"mcp1","output":"mcp result"}}`,
+			`{"timestamp":"t5","type":"response_item","payload":{"type":"function_call","name":"wait","call_id":"stop1","arguments":"{\"cell_id\":\"18\",\"terminate\":true}"}}`,
+			`{"timestamp":"t6","type":"response_item","payload":{"type":"function_call_output","call_id":"stop1","output":"stopped"}}`,
+		)
+		if len(events) != 5 {
+			t.Fatalf("got %d events, want command plus two generic call/result pairs: %+v", len(events), events)
+		}
+		for _, index := range []int{1, 3} {
+			if events[index].EventType != model.EventToolCall || events[index+1].EventType != model.EventToolResult {
+				t.Fatalf("events = %+v, unsafe waits must stay generic", events)
+			}
+		}
+	})
+
+	t.Run("reused call id drops old owner", func(t *testing.T) {
+		input := `const r = await tools.exec_command({cmd:"sleep 60"}); text(r);`
+		events := run(t,
+			`{"timestamp":"t1","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"cmd1","input":`+jsonString(input)+`}}`,
+			`{"timestamp":"t2","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"cmd1","output":"Script running with cell ID 18\nWall time 11.0 seconds\nOutput:\n"}}`,
+			`{"timestamp":"t3","type":"response_item","payload":{"type":"function_call","name":"wait","call_id":"same","arguments":"{\"cell_id\":\"18\"}"}}`,
+			`{"timestamp":"t4","type":"response_item","payload":{"type":"custom_tool_call","name":"other","call_id":"same","input":"{}"}}`,
+			`{"timestamp":"t5","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"same","output":"new owner"}}`,
+		)
+		if len(events) != 3 || events[1].EventType != model.EventToolCall || events[2].EventType != model.EventToolResult {
+			t.Fatalf("events = %+v, reused call id must not retain old command ownership", events)
+		}
+	})
+
+	t.Run("local shell takes reused wait id", func(t *testing.T) {
+		input := `const r = await tools.exec_command({cmd:"sleep 60"}); text(r);`
+		events := run(t,
+			`{"timestamp":"t1","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"cmd1","input":`+jsonString(input)+`}}`,
+			`{"timestamp":"t2","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"cmd1","output":"Script running with cell ID 18\nWall time 11.0 seconds\nOutput:\n"}}`,
+			`{"timestamp":"t3","type":"response_item","payload":{"type":"function_call","name":"wait","call_id":"same","arguments":"{\"cell_id\":\"18\"}"}}`,
+			`{"timestamp":"t4","type":"response_item","payload":{"type":"local_shell_call","call_id":"same","action":{"type":"exec","command":["echo","new"]}}}`,
+			`{"timestamp":"t5","type":"response_item","payload":{"type":"function_call_output","call_id":"same","output":"new"}}`,
+		)
+		if len(events) != 3 || events[1].EventType != model.EventCommandExec || events[1].ToolCallID != "same" ||
+			events[2].EventType != model.EventCommandResult || events[2].ToolCallID != "same" {
+			t.Fatalf("events = %+v, local shell must replace the pending wait owner", events)
+		}
+	})
+
+	t.Run("generic function takes reused shell id", func(t *testing.T) {
+		events := run(t,
+			`{"timestamp":"t1","type":"response_item","payload":{"type":"local_shell_call","call_id":"same","action":{"type":"exec","command":["echo","old"]}}}`,
+			`{"timestamp":"t2","type":"response_item","payload":{"type":"function_call","name":"other","call_id":"same","arguments":"{}"}}`,
+			`{"timestamp":"t3","type":"response_item","payload":{"type":"function_call_output","call_id":"same","output":"new owner"}}`,
+		)
+		if len(events) != 3 || events[1].EventType != model.EventToolCall || events[2].EventType != model.EventToolResult {
+			t.Fatalf("events = %+v, generic function must replace the shell owner", events)
+		}
+	})
+}
+
 func TestOpenClawEmbeddedCodexAmbiguousCodeModeStaysGeneric(t *testing.T) {
 	lines := []string{
 		`{"timestamp":"t","type":"session_meta","payload":{"id":"cx-code","cwd":"/w"}}`,
@@ -1141,6 +1276,49 @@ func TestOpenClawCodexEventMsgMcpToolErrorOutOfOrder(t *testing.T) {
 	}
 	if !hasTag(result.Tags, model.TagToolError) {
 		t.Errorf("out-of-order MCP failure must still tag the later tool.result: %+v", result.Tags)
+	}
+	assertOpenClawPointersResolve(t, res, lines)
+}
+
+func TestOpenClawCodexDeferredMCPFailureIsSingleUse(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"t","type":"session_meta","payload":{"id":"cx-single","cwd":"/w"}}`,
+		`{"timestamp":"t","type":"response_item","payload":{"type":"custom_tool_call","name":"mcp__db__query","call_id":"same","input":"SELECT 1"}}`,
+		`{"timestamp":"t","type":"event_msg","payload":{"type":"mcp_tool_call_end","call_id":"same","result":{"Err":"timeout"}}}`,
+		`{"timestamp":"t","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"same","output":"first"}}`,
+		`{"timestamp":"t","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"same","output":"duplicate"}}`,
+	}
+	res := extractOpenClaw(t, strings.Join(lines, "\n"))
+
+	var results []model.Event
+	for _, ev := range res.Events {
+		if ev.EventType == model.EventToolResult && ev.ToolCallID == "same" {
+			results = append(results, ev)
+		}
+	}
+	if len(results) != 2 {
+		t.Fatalf("got %d tool results, want 2: %+v", len(results), res.Events)
+	}
+	if !hasTag(results[0].Tags, model.TagToolError) || hasTag(results[1].Tags, model.TagToolError) {
+		t.Errorf("deferred failure leaked past its first result: %+v", results)
+	}
+	assertOpenClawPointersResolve(t, res, lines)
+}
+
+func TestOpenClawCodexNewCallClearsDeferredMCPFailure(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"t","type":"session_meta","payload":{"id":"cx-reuse","cwd":"/w"}}`,
+		`{"timestamp":"t","type":"response_item","payload":{"type":"custom_tool_call","name":"mcp__db__query","call_id":"same","input":"SELECT 1"}}`,
+		`{"timestamp":"t","type":"event_msg","payload":{"type":"mcp_tool_call_end","call_id":"same","result":{"Err":"timeout"}}}`,
+		`{"timestamp":"t","type":"response_item","payload":{"type":"function_call","name":"lookup","call_id":"same","arguments":"{}"}}`,
+		`{"timestamp":"t","type":"response_item","payload":{"type":"function_call_output","call_id":"same","output":"clean"}}`,
+	}
+	res := extractOpenClaw(t, strings.Join(lines, "\n"))
+
+	for _, ev := range res.Events {
+		if ev.EventType == model.EventToolResult && ev.ToolCallID == "same" && hasTag(ev.Tags, model.TagToolError) {
+			t.Fatalf("new call inherited a stale MCP failure: %+v", ev)
+		}
 	}
 	assertOpenClawPointersResolve(t, res, lines)
 }

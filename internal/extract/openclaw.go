@@ -52,9 +52,8 @@ type openClawState struct {
 	projectPath      string
 	currentTimestamp string
 	commandCalls     map[string]struct{}
-	// codexCodeModeCommandCalls records how an embedded Codex exec cell forwards
-	// its result. It remains separate from direct function-call correlation.
-	codexCodeModeCommandCalls map[string]codexCodeModeResultKind
+	// codexCodeMode keeps embedded Codex exec polling under one command identity.
+	codexCodeMode codexCodeModeTracker
 	// failedMCPCallIDs is the set of call_ids whose Codex-flavor mcp_tool_call_end
 	// recorded a structured failure BEFORE the matching custom_tool_call_output was
 	// emitted. The later output consults this so it still carries the tool-error
@@ -77,30 +76,17 @@ func (st *openClawState) noteCommandCall(id string) {
 	st.commandCalls[id] = struct{}{}
 }
 
-// isCommandCall reports whether a tool-call id was a recorded command call.
-func (st *openClawState) isCommandCall(id string) bool {
+// takeCommandCall consumes the command owner for a tool result.
+func (st *openClawState) takeCommandCall(id string) bool {
 	_, ok := st.commandCalls[id]
+	delete(st.commandCalls, id)
 	return ok
 }
 
-func (st *openClawState) noteCodexCodeModeCommandCall(id string, resultKind codexCodeModeResultKind) {
-	if id == "" {
-		return
-	}
-	if st.codexCodeModeCommandCalls == nil {
-		st.codexCodeModeCommandCalls = map[string]codexCodeModeResultKind{}
-	}
-	st.codexCodeModeCommandCalls[id] = resultKind
-}
-
-func (st *openClawState) forgetCodexCodeModeCommandCall(id string) {
-	delete(st.codexCodeModeCommandCalls, id)
-}
-
-func (st *openClawState) takeCodexCodeModeCommandCall(id string) (codexCodeModeResultKind, bool) {
-	resultKind, ok := st.codexCodeModeCommandCalls[id]
-	delete(st.codexCodeModeCommandCalls, id)
-	return resultKind, ok
+func (st *openClawState) resetCall(id string) {
+	delete(st.commandCalls, id)
+	delete(st.failedMCPCallIDs, id)
+	st.codexCodeMode.forgetCall(id)
 }
 
 // noteFailedMCPCall records a call_id whose mcp_tool_call_end reported a
@@ -116,9 +102,10 @@ func (st *openClawState) noteFailedMCPCall(id string) {
 	st.failedMCPCallIDs[id] = struct{}{}
 }
 
-// isFailedMCPCall reports whether call_id's mcp_tool_call_end reported failure.
-func (st *openClawState) isFailedMCPCall(id string) bool {
+// takeFailedMCPCall consumes a deferred MCP failure for a tool result.
+func (st *openClawState) takeFailedMCPCall(id string) bool {
 	_, ok := st.failedMCPCallIDs[id]
+	delete(st.failedMCPCallIDs, id)
 	return ok
 }
 
@@ -391,6 +378,7 @@ func (e OpenClawExtractor) emitNativeBashExecution(res *Result, src Source, sha 
 func (e OpenClawExtractor) emitNativeToolCall(res *Result, src Source, sha string, st *openClawState, line, block int, c *openClawBlock) {
 	args, argsField := c.nativeToolArgs()
 	callID := c.toolCallID()
+	st.resetCall(callID)
 	pointer := fmt.Sprintf("/message/content/%d", block)
 	if argsField != "" {
 		pointer += "/" + argsField
@@ -504,7 +492,7 @@ func (e OpenClawExtractor) emitNativeToolResult(res *Result, src Source, sha str
 	ev.ToolCallID = m.ToolCallID
 	ev.ToolName = m.ToolName
 	ev.Evidence.JSONPointer = "/message"
-	if st.isCommandCall(m.ToolCallID) {
+	if st.takeCommandCall(m.ToolCallID) {
 		ev.EventType = model.EventCommandResult
 		ev.ExitCode = openClawExitCode(m.Details)
 	} else {
@@ -578,7 +566,7 @@ func (e OpenClawExtractor) emitToolResult(res *Result, src Source, sha string, s
 	resultID := c.toolResultID()
 	ev.ToolCallID = resultID
 	ev.Evidence.JSONPointer = fmt.Sprintf("/message/content/%d", block)
-	if st.isCommandCall(resultID) {
+	if st.takeCommandCall(resultID) {
 		ev.EventType = model.EventCommandResult
 	} else {
 		ev.EventType = model.EventToolResult

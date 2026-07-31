@@ -86,6 +86,7 @@ const (
 	codexToolWriteFile    = "create_file"
 	codexToolEditFile     = "edit_file"
 	codexToolCodeModeExec = "exec"
+	codexToolWait         = "wait"
 	codexToolUpdatePlan   = "update_plan"
 	codexToolSearch       = "tool_search"
 	codexToolImage        = "image_generation"

@@ -100,8 +100,13 @@ func (e OpenClawExtractor) mapCodexResponseItem(res *Result, src Source, sha str
 	case codexRIMessage:
 		e.emitCodexMessage(res, src, sha, st, line, &ri)
 	case codexRIFunctionCall:
+		st.resetCall(ri.CallID)
+		if ri.Name == codexToolWait && ri.Namespace == "" && st.codexCodeMode.noteWait(ri.CallID, string(ri.Arguments)) {
+			return
+		}
 		e.emitCodexFunctionCall(res, src, sha, st, line, &ri)
 	case codexRILocalShellCall:
+		st.resetCall(ri.CallID)
 		ev := e.base(src, sha, st, line, 0)
 		ev.Actor = model.ActorAssistant
 		ev.Confidence = model.ConfidenceHigh
@@ -119,19 +124,27 @@ func (e OpenClawExtractor) mapCodexResponseItem(res *Result, src Source, sha str
 		ev.ToolCallID = ri.CallID
 		ev.Evidence.JSONPointer = "/payload/output"
 		resultBody := decodeCodexOutput(ri.Output)
-		// An output paired with the matching shell-call variant is a
-		// command.result; every other output stays tool.result.
-		var codeModeResultKind codexCodeModeResultKind
+		// Outputs correlated to a shell call are command.result updates. Static
+		// code-mode calls may traverse internal wait/write_stdin calls; those are
+		// folded back into the original command identity.
+		var codeModeRef codexCodeModeResultRef
 		var codeModeResult bool
-		if ri.Type == codexRICustomToolCallOut {
-			codeModeResultKind, codeModeResult = st.takeCodexCodeModeCommandCall(ri.CallID)
+		switch ri.Type {
+		case codexRICustomToolCallOut:
+			codeModeRef, codeModeResult = st.codexCodeMode.takeCustomCall(ri.CallID)
+		case codexRIFunctionCallOutput:
+			codeModeRef, codeModeResult = st.codexCodeMode.takeWaitCall(ri.CallID)
 		}
-		if (ri.Type == codexRIFunctionCallOutput && st.isCommandCall(ri.CallID)) ||
-			(ri.Type == codexRICustomToolCallOut && codeModeResult) {
+		commandResult := ri.Type == codexRIFunctionCallOutput && st.takeCommandCall(ri.CallID)
+		if codeModeResult || commandResult {
 			ev.EventType = model.EventCommandResult
 			if codeModeResult {
 				ev.ToolName = codexToolExecCommand
-				outcome := decodeCodexCodeModeOutcome(ri.Output, codeModeResultKind)
+				outcome := st.codexCodeMode.trackOutcome(codeModeRef, ri.Output)
+				if outcome.cellID != "" {
+					return
+				}
+				ev.ToolCallID = codeModeRef.commandCallID
 				resultBody = outcome.output
 				ev.ExitCode = outcome.exitCode
 				ev.DurationMs = outcome.durationMs
@@ -147,7 +160,7 @@ func (e OpenClawExtractor) mapCodexResponseItem(res *Result, src Source, sha str
 			// An mcp_tool_call_end may have recorded this call's failure before its
 			// output landed (out-of-order); carry the structured tool-error forward so
 			// the late output is not a false negative, matching codex.go.
-			if st.isFailedMCPCall(ri.CallID) {
+			if st.takeFailedMCPCall(ri.CallID) {
 				ev.Tags = append(ev.Tags, model.TagToolError)
 			}
 		}
@@ -173,8 +186,8 @@ func (e OpenClawExtractor) mapCodexResponseItem(res *Result, src Source, sha str
 		ev.Evidence.JSONPointer = "/payload/action"
 		res.appendEvent(st, ev, true)
 	case codexRICustomToolCall:
-		// A later custom call reusing a malformed call id owns its next output.
-		st.forgetCodexCodeModeCommandCall(ri.CallID)
+		// A new call owns a reused id and its next output.
+		st.resetCall(ri.CallID)
 		if ri.Name == codexToolCodeModeExec {
 			if call, ok := parseCodexCodeModeExec(string(ri.Input)); ok {
 				ev := e.base(src, sha, st, line, 0)
@@ -185,8 +198,11 @@ func (e OpenClawExtractor) mapCodexResponseItem(res *Result, src Source, sha str
 				ev.EventType = model.EventCommandExec
 				ev.Command = call.command
 				ev.Evidence.JSONPointer = "/payload/input"
-				st.noteCodexCodeModeCommandCall(ri.CallID, call.resultKind)
+				st.codexCodeMode.noteExec(ri.CallID, call.resultKind)
 				res.appendEvent(st, ev, true)
+				return
+			}
+			if st.codexCodeMode.noteWriteStdinPoll(ri.CallID, string(ri.Input)) {
 				return
 			}
 		}

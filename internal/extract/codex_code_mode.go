@@ -8,9 +8,11 @@ import (
 )
 
 // Codex code mode persists one JavaScript cell as a custom tool call. Promote
-// only the common, unambiguous shape whose first operation is one static shell
-// call; arbitrary or compound programs stay generic tool.call events.
-var codexCodeModeExecPrefix = regexp.MustCompile(`^const[[:space:]]+([A-Za-z_$][A-Za-z0-9_$]*)[[:space:]]*=[[:space:]]*await[[:space:]]+tools\.exec_command[[:space:]]*\([[:space:]]*`)
+// only common, unambiguous static calls; arbitrary programs stay generic.
+var (
+	codexCodeModeExecPrefix       = regexp.MustCompile(`^const[[:space:]]+([A-Za-z_$][A-Za-z0-9_$]*)[[:space:]]*=[[:space:]]*await[[:space:]]+tools\.exec_command[[:space:]]*\([[:space:]]*`)
+	codexCodeModeWriteStdinPrefix = regexp.MustCompile(`^const[[:space:]]+([A-Za-z_$][A-Za-z0-9_$]*)[[:space:]]*=[[:space:]]*await[[:space:]]+tools\.write_stdin[[:space:]]*\([[:space:]]*`)
+)
 
 const codexCodeModeStringToken = "<string>"
 
@@ -31,8 +33,24 @@ type codexCodeModeOutcome struct {
 	output     string
 	exitCode   *int
 	durationMs *int64
+	cellID     string
+	sessionID  string
 	toolError  bool
 	recognized bool
+}
+
+type codexCodeModeResultRef struct {
+	commandCallID string
+	resultKind    codexCodeModeResultKind
+	sessionID     string
+	sessionPoll   bool
+}
+
+type codexCodeModeTracker struct {
+	customCalls map[string]codexCodeModeResultRef
+	waitCalls   map[string]codexCodeModeResultRef
+	cells       map[string]codexCodeModeResultRef
+	sessions    map[string]codexCodeModeResultRef
 }
 
 func codexCodeModeExecCommand(input string) (string, bool) {
@@ -41,28 +59,55 @@ func codexCodeModeExecCommand(input string) (string, bool) {
 }
 
 func parseCodexCodeModeExec(input string) (codexCodeModeExec, bool) {
+	args, resultKind, ok := parseCodexCodeModeStaticCall(input, codexCodeModeExecPrefix)
+	if !ok {
+		return codexCodeModeExec{}, false
+	}
+	command, ok := args["cmd"].(string)
+	if !ok || strings.TrimSpace(command) == "" {
+		return codexCodeModeExec{}, false
+	}
+	return codexCodeModeExec{command: command, resultKind: resultKind}, true
+}
+
+func parseCodexCodeModeWriteStdinPoll(input string) (sessionID string, resultKind codexCodeModeResultKind, ok bool) {
+	args, resultKind, ok := parseCodexCodeModeStaticCall(input, codexCodeModeWriteStdinPrefix)
+	if !ok || resultKind == codexCodeModeResultNone {
+		return "", codexCodeModeResultNone, false
+	}
+	if chars, exists := args["chars"]; exists {
+		text, isString := chars.(string)
+		if !isString || text != "" {
+			return "", codexCodeModeResultNone, false
+		}
+	}
+	sessionID, ok = codexCodeModeStaticID(args["session_id"])
+	return sessionID, resultKind, ok
+}
+
+func parseCodexCodeModeStaticCall(input string, prefix *regexp.Regexp) (map[string]any, codexCodeModeResultKind, bool) {
 	s := strings.TrimSpace(input)
 	if strings.HasPrefix(s, "// @exec:") {
 		newline := strings.IndexByte(s, '\n')
 		if newline < 0 {
-			return codexCodeModeExec{}, false
+			return nil, codexCodeModeResultNone, false
 		}
 		s = strings.TrimSpace(s[newline+1:])
 	}
 
-	match := codexCodeModeExecPrefix.FindStringSubmatchIndex(s)
+	match := prefix.FindStringSubmatchIndex(s)
 	if match == nil || !isCodexCodeModeBindingName(s[match[2]:match[3]]) {
-		return codexCodeModeExec{}, false
+		return nil, codexCodeModeResultNone, false
 	}
 	resultName := s[match[2]:match[3]]
 
-	command, end, ok := parseCodexCodeModeExecArgs(s, match[1])
+	args, end, ok := parseCodexCodeModeArgs(s, match[1])
 	if !ok {
-		return codexCodeModeExec{}, false
+		return nil, codexCodeModeResultNone, false
 	}
 	end = skipASCIIWhitespace(s, end)
 	if end >= len(s) || s[end] != ')' {
-		return codexCodeModeExec{}, false
+		return nil, codexCodeModeResultNone, false
 	}
 	end++
 	var lineBreak bool
@@ -73,16 +118,16 @@ func parseCodexCodeModeExec(input string) (codexCodeModeExec, bool) {
 		separated = true
 	}
 	if skipASCIIWhitespace(s, end) < len(s) && !separated {
-		return codexCodeModeExec{}, false
+		return nil, codexCodeModeResultNone, false
 	}
 
 	// Accept only an empty tail or the common result-forwarding forms. Any other
 	// JavaScript may contain another operation or alter the meaning of the output.
 	resultKind, ok := codexCodeModeResultTail(s[end:], resultName)
 	if !ok {
-		return codexCodeModeExec{}, false
+		return nil, codexCodeModeResultNone, false
 	}
-	return codexCodeModeExec{command: command, resultKind: resultKind}, true
+	return args, resultKind, true
 }
 
 func codexCodeModeResultTail(s, resultName string) (codexCodeModeResultKind, bool) {
@@ -117,7 +162,7 @@ func codexCodeModeResultTail(s, resultName string) (codexCodeModeResultKind, boo
 var (
 	codexCodeModeOutputEnvelope  = regexp.MustCompile(`^Script completed\nWall time [0-9]+(?:\.[0-9]+)? seconds\nOutput:\n$`)
 	codexCodeModeFailedEnvelope  = regexp.MustCompile(`^Script failed\nWall time [0-9]+(?:\.[0-9]+)? seconds\nOutput:\n$`)
-	codexCodeModeRunningEnvelope = regexp.MustCompile(`^Script running with cell ID [^\n]+\nWall time [0-9]+(?:\.[0-9]+)? seconds\nOutput:\n`)
+	codexCodeModeRunningEnvelope = regexp.MustCompile(`^Script running with cell ID ([^\n]+)\nWall time [0-9]+(?:\.[0-9]+)? seconds\nOutput:\n$`)
 )
 
 func decodeCodexCodeModeOutput(raw json.RawMessage) (string, bool) {
@@ -139,6 +184,13 @@ func decodeCodexCodeModeOutcome(raw json.RawMessage, kind codexCodeModeResultKin
 		output:     decodeCodexOutput(raw),
 		recognized: kind != codexCodeModeResultObject,
 	}
+	// A running cell is a plain control envelope. Completed command stdout is
+	// carried in separate content items, so it cannot impersonate this shape.
+	if cellID, ok := codexCodeModeRunningCellID(raw); ok {
+		outcome.cellID = cellID
+		outcome.recognized = true
+		return outcome
+	}
 	if body, ok := decodeCodexCodeModeEnvelope(raw, codexCodeModeFailedEnvelope); ok {
 		outcome.output = body
 		outcome.toolError = true
@@ -151,47 +203,205 @@ func decodeCodexCodeModeOutcome(raw json.RawMessage, kind codexCodeModeResultKin
 	if kind != codexCodeModeResultObject {
 		return outcome
 	}
-	if isCodexCodeModeRunningOutput(raw) {
-		outcome.recognized = true
-		return outcome
-	}
 
-	body, exitCode, durationMs, ok := decodeCodexCodeModeResultObject(raw)
+	body, exitCode, durationMs, sessionID, ok := decodeCodexCodeModeResultObject(raw)
 	if !ok {
 		return outcome
 	}
 	outcome.output = body
 	outcome.exitCode = exitCode
 	outcome.durationMs = durationMs
+	outcome.sessionID = sessionID
 	outcome.toolError = exitCode != nil && *exitCode != 0
 	outcome.recognized = true
 	return outcome
 }
 
-func decodeCodexCodeModeResultObject(raw json.RawMessage) (output string, exitCode *int, durationMs *int64, ok bool) {
+func decodeCodexCodeModeResultObject(raw json.RawMessage) (output string, exitCode *int, durationMs *int64, sessionID string, ok bool) {
 	body, ok := decodeCodexCodeModeOutput(raw)
 	if !ok {
-		return "", nil, nil, false
+		return "", nil, nil, "", false
 	}
 	var result struct {
-		ExitCode        *int     `json:"exit_code"`
-		Output          *string  `json:"output"`
-		WallTimeSeconds *float64 `json:"wall_time_seconds"`
+		ExitCode        *int            `json:"exit_code"`
+		Output          *string         `json:"output"`
+		SessionID       json.RawMessage `json:"session_id"`
+		WallTimeSeconds *float64        `json:"wall_time_seconds"`
 	}
 	if json.Unmarshal([]byte(body), &result) != nil || result.Output == nil {
-		return "", nil, nil, false
+		return "", nil, nil, "", false
+	}
+	if len(result.SessionID) > 0 && string(result.SessionID) != "null" {
+		var valid bool
+		sessionID, valid = codexCodeModeRawID(result.SessionID)
+		if !valid {
+			return "", nil, nil, "", false
+		}
 	}
 	if result.ExitCode != nil && result.WallTimeSeconds != nil &&
 		*result.WallTimeSeconds >= 0 && *result.WallTimeSeconds < float64(math.MaxInt64/1000) {
 		milliseconds := int64(math.Round(*result.WallTimeSeconds * 1000))
 		durationMs = &milliseconds
 	}
-	return *result.Output, result.ExitCode, durationMs, true
+	return *result.Output, result.ExitCode, durationMs, sessionID, true
 }
 
-func isCodexCodeModeRunningOutput(raw json.RawMessage) bool {
+func codexCodeModeRawID(raw json.RawMessage) (string, bool) {
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.UseNumber()
+	var value any
+	if decoder.Decode(&value) != nil {
+		return "", false
+	}
+	return codexCodeModeStaticID(value)
+}
+
+func codexCodeModeRunningCellID(raw json.RawMessage) (string, bool) {
 	var output string
-	return json.Unmarshal(raw, &output) == nil && codexCodeModeRunningEnvelope.MatchString(output)
+	if json.Unmarshal(raw, &output) != nil {
+		return "", false
+	}
+	match := codexCodeModeRunningEnvelope.FindStringSubmatch(output)
+	if len(match) != 2 || strings.TrimSpace(match[1]) == "" {
+		return "", false
+	}
+	return match[1], true
+}
+
+func (t *codexCodeModeTracker) noteExec(callID string, resultKind codexCodeModeResultKind) {
+	if callID == "" {
+		return
+	}
+	if t.customCalls == nil {
+		t.customCalls = make(map[string]codexCodeModeResultRef)
+	}
+	t.customCalls[callID] = codexCodeModeResultRef{
+		commandCallID: callID,
+		resultKind:    resultKind,
+	}
+}
+
+func (t *codexCodeModeTracker) noteWriteStdinPoll(callID, input string) bool {
+	if callID == "" {
+		return false
+	}
+	sessionID, resultKind, ok := parseCodexCodeModeWriteStdinPoll(input)
+	if !ok {
+		return false
+	}
+	ref, ok := t.sessions[sessionID]
+	if !ok {
+		return false
+	}
+	ref.resultKind = resultKind
+	ref.sessionPoll = true
+	ref.sessionID = sessionID
+	if t.customCalls == nil {
+		t.customCalls = make(map[string]codexCodeModeResultRef)
+	}
+	t.customCalls[callID] = ref
+	return true
+}
+
+func (t *codexCodeModeTracker) noteWait(callID, arguments string) bool {
+	if callID == "" {
+		return false
+	}
+	cellID, terminate, ok := codexCodeModeWaitCellID(arguments)
+	if !ok {
+		return false
+	}
+	if terminate {
+		delete(t.cells, cellID)
+		return false
+	}
+	ref, ok := t.cells[cellID]
+	if !ok {
+		return false
+	}
+	delete(t.cells, cellID)
+	if t.waitCalls == nil {
+		t.waitCalls = make(map[string]codexCodeModeResultRef)
+	}
+	t.waitCalls[callID] = ref
+	return true
+}
+
+func (t *codexCodeModeTracker) forgetCall(callID string) {
+	delete(t.customCalls, callID)
+	delete(t.waitCalls, callID)
+	forgetCodexCodeModeOwner(t.customCalls, callID)
+	forgetCodexCodeModeOwner(t.waitCalls, callID)
+	forgetCodexCodeModeOwner(t.cells, callID)
+	forgetCodexCodeModeOwner(t.sessions, callID)
+}
+
+func forgetCodexCodeModeOwner(entries map[string]codexCodeModeResultRef, callID string) {
+	for id, ref := range entries {
+		if ref.commandCallID == callID {
+			delete(entries, id)
+		}
+	}
+}
+
+func (t *codexCodeModeTracker) takeCustomCall(callID string) (codexCodeModeResultRef, bool) {
+	ref, ok := t.customCalls[callID]
+	delete(t.customCalls, callID)
+	return ref, ok
+}
+
+func (t *codexCodeModeTracker) takeWaitCall(callID string) (codexCodeModeResultRef, bool) {
+	ref, ok := t.waitCalls[callID]
+	delete(t.waitCalls, callID)
+	return ref, ok
+}
+
+func (t *codexCodeModeTracker) trackOutcome(ref codexCodeModeResultRef, raw json.RawMessage) codexCodeModeOutcome {
+	outcome := decodeCodexCodeModeOutcome(raw, ref.resultKind)
+	if outcome.cellID != "" {
+		if t.cells == nil {
+			t.cells = make(map[string]codexCodeModeResultRef)
+		}
+		t.cells[outcome.cellID] = ref
+	}
+	if outcome.sessionID != "" {
+		if ref.sessionID != "" && ref.sessionID != outcome.sessionID {
+			delete(t.sessions, ref.sessionID)
+		}
+		if t.sessions == nil {
+			t.sessions = make(map[string]codexCodeModeResultRef)
+		}
+		next := ref
+		next.sessionPoll = true
+		next.sessionID = outcome.sessionID
+		t.sessions[outcome.sessionID] = next
+	}
+	if outcome.exitCode != nil || outcome.toolError {
+		if ref.sessionID != "" {
+			delete(t.sessions, ref.sessionID)
+		}
+		if outcome.sessionID != "" {
+			delete(t.sessions, outcome.sessionID)
+		}
+	}
+	if ref.sessionPoll {
+		outcome.durationMs = nil
+	}
+	return outcome
+}
+
+func codexCodeModeWaitCellID(arguments string) (cellID string, terminate bool, ok bool) {
+	var args map[string]json.RawMessage
+	if json.Unmarshal([]byte(arguments), &args) != nil {
+		return "", false, false
+	}
+	if raw, exists := args["terminate"]; exists {
+		if json.Unmarshal(raw, &terminate) != nil {
+			return "", false, false
+		}
+	}
+	cellID, ok = codexCodeModeRawID(args["cell_id"])
+	return cellID, terminate, ok
 }
 
 func codexCodeModeTailTokens(s string) ([]string, bool) {
@@ -247,34 +457,33 @@ func codexCodeModeTokensEqual(got []string, want ...string) bool {
 	return true
 }
 
-func parseCodexCodeModeExecArgs(s string, start int) (string, int, bool) {
+func parseCodexCodeModeArgs(s string, start int) (map[string]any, int, bool) {
 	i := skipASCIIWhitespace(s, start)
 	if i >= len(s) || s[i] != '{' {
-		return "", 0, false
+		return nil, 0, false
 	}
 	i++
 
-	var command string
-	seenCommand := false
+	args := make(map[string]any)
 	for {
 		i = skipASCIIWhitespace(s, i)
 		if i >= len(s) {
-			return "", 0, false
+			return nil, 0, false
 		}
 		if s[i] == '}' {
-			if !seenCommand || strings.TrimSpace(command) == "" {
-				return "", 0, false
-			}
-			return command, i + 1, true
+			return args, i + 1, true
 		}
 
 		key, next, ok := parseCodexCodeModePropertyName(s, i)
 		if !ok {
-			return "", 0, false
+			return nil, 0, false
+		}
+		if _, duplicate := args[key]; duplicate {
+			return nil, 0, false
 		}
 		i = skipASCIIWhitespace(s, next)
 		if i >= len(s) || s[i] != ':' {
-			return "", 0, false
+			return nil, 0, false
 		}
 		i = skipASCIIWhitespace(s, i+1)
 
@@ -282,43 +491,41 @@ func parseCodexCodeModeExecArgs(s string, start int) (string, int, bool) {
 		decoder := json.NewDecoder(strings.NewReader(s[i:]))
 		decoder.UseNumber()
 		if err := decoder.Decode(&value); err != nil || decoder.InputOffset() <= 0 {
-			return "", 0, false
+			return nil, 0, false
 		}
 		i += int(decoder.InputOffset())
-		if key == "cmd" {
-			if seenCommand {
-				return "", 0, false
-			}
-			var isString bool
-			command, isString = value.(string)
-			if !isString {
-				return "", 0, false
-			}
-			seenCommand = true
-		}
+		args[key] = value
 
 		i = skipASCIIWhitespace(s, i)
 		if i >= len(s) {
-			return "", 0, false
+			return nil, 0, false
 		}
 		switch s[i] {
 		case '}':
-			if !seenCommand || strings.TrimSpace(command) == "" {
-				return "", 0, false
-			}
-			return command, i + 1, true
+			return args, i + 1, true
 		case ',':
 			i++
 			if next := skipASCIIWhitespace(s, i); next < len(s) && s[next] == '}' {
-				if !seenCommand || strings.TrimSpace(command) == "" {
-					return "", 0, false
-				}
-				return command, next + 1, true
+				return args, next + 1, true
 			}
 		default:
-			return "", 0, false
+			return nil, 0, false
 		}
 	}
+}
+
+func codexCodeModeStaticID(value any) (string, bool) {
+	switch value := value.(type) {
+	case json.Number:
+		if _, err := value.Int64(); err == nil {
+			return value.String(), true
+		}
+	case string:
+		if strings.TrimSpace(value) != "" {
+			return value, true
+		}
+	}
+	return "", false
 }
 
 func parseCodexCodeModePropertyName(s string, start int) (string, int, bool) {

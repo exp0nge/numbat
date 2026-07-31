@@ -803,6 +803,45 @@ func TestExtractCodexMCPToolFailureBeforeOutput(t *testing.T) {
 	}
 }
 
+func TestExtractCodexMCPDeferredFailureIsSingleUse(t *testing.T) {
+	body := strings.Join([]string{
+		`{"timestamp":"t1","type":"response_item","payload":{"type":"custom_tool_call","name":"mcp__db__query","call_id":"same","input":"SELECT 1"}}`,
+		`{"timestamp":"t2","type":"event_msg","payload":{"type":"mcp_tool_call_end","call_id":"same","result":{"Err":"timeout"}}}`,
+		`{"timestamp":"t3","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"same","output":"first"}}`,
+		`{"timestamp":"t4","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"same","output":"duplicate"}}`,
+	}, "\n")
+	acts := activityEvents(extractCodex(t, body).Events)
+
+	var results []model.Event
+	for _, ev := range acts {
+		if ev.EventType == model.EventToolResult && ev.ToolCallID == "same" {
+			results = append(results, ev)
+		}
+	}
+	if len(results) != 2 {
+		t.Fatalf("got %d tool results, want 2:\n%s", len(results), dumpEvents(acts))
+	}
+	if !hasTag(results[0].Tags, model.TagToolError) || hasTag(results[1].Tags, model.TagToolError) {
+		t.Errorf("deferred failure leaked past its first result: %+v", results)
+	}
+}
+
+func TestExtractCodexNewCallClearsDeferredMCPFailure(t *testing.T) {
+	body := strings.Join([]string{
+		`{"timestamp":"t1","type":"response_item","payload":{"type":"custom_tool_call","name":"mcp__db__query","call_id":"same","input":"SELECT 1"}}`,
+		`{"timestamp":"t2","type":"event_msg","payload":{"type":"mcp_tool_call_end","call_id":"same","result":{"Err":"timeout"}}}`,
+		`{"timestamp":"t3","type":"response_item","payload":{"type":"function_call","name":"lookup","call_id":"same","arguments":"{}"}}`,
+		`{"timestamp":"t4","type":"response_item","payload":{"type":"function_call_output","call_id":"same","output":"clean"}}`,
+	}, "\n")
+	acts := activityEvents(extractCodex(t, body).Events)
+
+	for _, ev := range acts {
+		if ev.EventType == model.EventToolResult && ev.ToolCallID == "same" && hasTag(ev.Tags, model.TagToolError) {
+			t.Fatalf("new call inherited a stale MCP failure: %+v", ev)
+		}
+	}
+}
+
 // A generic custom_tool_call_output must not become a command.result merely
 // because its id collides with a direct shell call. Variant-specific state keeps
 // it as a tool.result carrying the same id.
