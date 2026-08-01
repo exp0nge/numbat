@@ -101,7 +101,7 @@ func TestStringKnownFalseNegatives(t *testing.T) {
 	}
 }
 
-func TestStringMasksURLUserinfoPasswords(t *testing.T) {
+func TestStringMasksURLUserinfo(t *testing.T) {
 	tests := []struct {
 		in   string
 		want string

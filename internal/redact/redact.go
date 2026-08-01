@@ -37,8 +37,8 @@ var (
 	)
 )
 
-// urlPasswordMask is valid URL userinfo and cannot be mined as an email local part.
-const urlPasswordMask = "***"
+// urlUserinfoMask is valid URL userinfo and cannot be mined as an email local part.
+const urlUserinfoMask = "***"
 
 // secretKey matches a secret-looking assignment key (env var, JSON field,
 // YAML key). Capture group 1 is the key text as written.
@@ -82,7 +82,7 @@ const maxCredentialQueryKeyLen = len("x-amz-security-token")
 // patterns are limited to non-URL spans to avoid masking benign query keys such
 // as id_token.
 func String(s string) string {
-	s = maskURLUserinfoPasswords(s)
+	s = maskURLUserinfo(s)
 	s = maskAuthorizationCredentials(s)
 	s = maskCredentialValues(s)
 	var b strings.Builder
@@ -104,7 +104,7 @@ func maskAuthorizationCredentials(s string) string {
 	return authorizationCredentialPattern.ReplaceAllString(s, "${1}${2}"+Mask)
 }
 
-func maskURLUserinfoPasswords(s string) string {
+func maskURLUserinfo(s string) string {
 	var b strings.Builder
 	last := 0
 	for _, loc := range uriSchemePattern.FindAllStringIndex(s, -1) {
@@ -121,14 +121,14 @@ func maskURLUserinfoPasswords(s string) string {
 		if colon < 0 {
 			continue
 		}
-		passwordStart := authorityStart + colon + 1
-		passwordEnd := authorityStart + at
-		if passwordStart >= passwordEnd {
+		credentialStart := authorityStart + colon + 1
+		credentialEnd := authorityStart + at
+		if credentialStart >= credentialEnd {
 			continue
 		}
-		b.WriteString(s[last:passwordStart])
-		b.WriteString(urlPasswordMask)
-		last = passwordEnd
+		b.WriteString(s[last:credentialStart])
+		b.WriteString(urlUserinfoMask)
+		last = credentialEnd
 	}
 	if last == 0 {
 		return s
