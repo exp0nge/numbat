@@ -1,11 +1,11 @@
 id: exec.download_pipe_shell
-version: "1.3"
+version: "1.4"
 enabled: true
 title: Downloaded content piped into an interpreter
 description: |-
   A curl/wget download was piped into a shell or scripting interpreter in a form that
-  executes standard input. Commands that pass a local script or source file to the
-  interpreter are excluded because the downloaded bytes are not what executes.
+  executes standard input. Commands that pass a local script or override the
+  interpreter's standard input are excluded because the downloaded bytes are not what executes.
 severity: high
 expr: |-
   (event.event_type == "command.exec" || (event.source_type == "otel" && event.event_type == "command.result")) &&
@@ -13,8 +13,12 @@ expr: |-
     download.name in ["curl", "wget"] &&
     download.pipeline_id > 0 &&
     shell_commands.exists(interpreter,
-      interpreter.statement_id != download.statement_id &&
+      download.statement_id < interpreter.statement_id &&
       interpreter.pipeline_id == download.pipeline_id &&
+      !interpreter.redirects.exists(redirect,
+        redirect.fd == 0 &&
+        !(redirect.op == "duplicate" && redirect.target.matches("^0+$"))
+      ) &&
       (
         (
           interpreter.name in ["sh", "bash", "zsh", "dash", "ksh"] &&

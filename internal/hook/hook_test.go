@@ -1,12 +1,20 @@
 package hook
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/perplexityai/numbat/internal/model"
 )
 
 const testDiffSHA256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+func TestPreviewDoesNotCutToken(t *testing.T) {
+	input := "prefix " + strings.Repeat("x", previewMax+1)
+	if got := preview(input); got != "prefix" {
+		t.Fatalf("preview = %q, want complete prefix token", got)
+	}
+}
 
 // every hook-sourced event must be stamped source_type=hook and confidence
 // medium, with a thin hook evidence record that never fabricates a file/line —
