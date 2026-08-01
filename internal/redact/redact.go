@@ -6,6 +6,7 @@
 package redact
 
 import (
+	"net/url"
 	"regexp"
 	"strings"
 )
@@ -113,16 +114,12 @@ func maskURLUserinfo(s string) string {
 			continue
 		}
 		authorityEnd := uriAuthorityEnd(s, authorityStart)
-		at := strings.LastIndexByte(s[authorityStart:authorityEnd], '@')
-		if at < 0 {
+		passwordStart, passwordEnd, ok := uriPasswordSpan(s[authorityStart:authorityEnd])
+		if !ok {
 			continue
 		}
-		colon := strings.IndexByte(s[authorityStart:authorityStart+at], ':')
-		if colon < 0 {
-			continue
-		}
-		credentialStart := authorityStart + colon + 1
-		credentialEnd := authorityStart + at
+		credentialStart := authorityStart + passwordStart
+		credentialEnd := authorityStart + passwordEnd
 		if credentialStart >= credentialEnd {
 			continue
 		}
@@ -135,6 +132,65 @@ func maskURLUserinfo(s string) string {
 	}
 	b.WriteString(s[last:])
 	return b.String()
+}
+
+// uriPasswordSpan finds user:password only when an @ is followed by a valid
+// host. Choosing the first such @ preserves @ inside passwords without letting
+// a later email address steal the host from an earlier DSN.
+func uriPasswordSpan(authority string) (int, int, bool) {
+	for search := 0; search < len(authority); {
+		rel := strings.IndexByte(authority[search:], '@')
+		if rel < 0 {
+			return 0, 0, false
+		}
+		at := search + rel
+		hostEnd := at + 1
+		for hostEnd < len(authority) && !uriHostTerminator(authority[hostEnd]) {
+			hostEnd++
+		}
+		if validURIHost(authority[at+1 : hostEnd]) {
+			colon := strings.IndexByte(authority[:at], ':')
+			if colon < 0 || completeHostPortBeforeSeparator(authority[:at]) {
+				return 0, 0, false
+			}
+			return colon + 1, at, colon+1 < at
+		}
+		search = at + 1
+	}
+	return 0, 0, false
+}
+
+func uriHostTerminator(b byte) bool {
+	switch b {
+	case ',', ';', '&', '\'', '(', ')', '*', '+', '=':
+		return true
+	}
+	return uriAuthorityTerminator(b)
+}
+
+func validURIHost(hostport string) bool {
+	if hostport == "" || strings.ContainsRune(hostport, '@') {
+		return false
+	}
+	u, err := url.Parse("scheme://" + hostport)
+	return err == nil && u.User == nil && u.Host == hostport && u.Hostname() != ""
+}
+
+// completeHostPortBeforeSeparator recognizes "host:port;...@..." prose. The
+// dotted/IP host requirement avoids treating an ordinary user:digits password
+// as a completed network authority.
+func completeHostPortBeforeSeparator(beforeAt string) bool {
+	sep := strings.IndexAny(beforeAt, ",;")
+	if sep < 0 {
+		return false
+	}
+	prefix := beforeAt[:sep]
+	u, err := url.Parse("scheme://" + prefix)
+	if err != nil || u.User != nil || u.Host != prefix || u.Hostname() == "" || u.Port() == "" {
+		return false
+	}
+	host := u.Hostname()
+	return strings.ContainsRune(host, '.') || strings.ContainsRune(host, ':')
 }
 
 func uriAuthorityEnd(s string, start int) int {

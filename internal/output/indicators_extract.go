@@ -46,12 +46,10 @@ const maxExtractedIndicatorsPerField = 256
 // pipeline is captured without trailing pipe/redirect noise.
 var urlInText = regexp.MustCompile(`(?i:https?)://[^\s"'<>` + "`" + `|;)\\]+`)
 
-// uriAuthorityInText locates generic URI authorities. Their hosts are classified
-// directly; the full authority is then fenced from standalone miners so userinfo
-// cannot be reclassified as an indicator.
-var uriAuthorityInText = regexp.MustCompile(
-	`(?i:[a-z][a-z0-9+.-]*)://[A-Za-z0-9._~!$&'()*+,;=:%@\[\]-]+`,
-)
+// uriSchemeInText starts generic URI authority scanning. A small walker below
+// finds the actual host boundary because userinfo may contain URI punctuation
+// that also separates adjacent prose.
+var uriSchemeInText = regexp.MustCompile(`(?i:[a-z][a-z0-9+.-]*)://`)
 
 // emailInText matches a conservative email address shape. The local part and
 // domain are restricted to the characters that appear in real addresses; the TLD
@@ -136,16 +134,15 @@ func extractIndicators(s string, markdown bool) ([]typedIndicator, bool) {
 		add(htyp, hval)
 	}
 
-	uriMatches := uriAuthorityInText.FindAllStringIndex(s, maxExtractedIndicatorsPerField+1)
+	uriMatches := uriAuthorities(s, maxExtractedIndicatorsPerField+1)
 	if len(uriMatches) > maxExtractedIndicatorsPerField {
 		truncated = true
 	}
 	for _, loc := range uriMatches {
-		host, ok := nonHTTPURIHost(s[loc[0]:loc[1]])
-		if !ok {
+		if loc.host == "" {
 			continue
 		}
-		if typ, val := classifyHost(host); typ != "" {
+		if typ, val := classifyHost(loc.host); typ != "" {
 			add(typ, val)
 		}
 	}
@@ -194,30 +191,87 @@ func extractIndicators(s string, markdown bool) ([]typedIndicator, bool) {
 	return out, truncated
 }
 
-func nonHTTPURIHost(raw string) (string, bool) {
-	schemeEnd := strings.Index(raw, "://")
-	if schemeEnd <= 0 {
-		return "", false
-	}
-	scheme := raw[:schemeEnd]
-	if strings.EqualFold(scheme, "http") || strings.EqualFold(scheme, "https") {
-		return "", false
-	}
-	authority := raw[schemeEnd+3:]
-	if at := strings.LastIndexByte(authority, '@'); at >= 0 {
-		authority = authority[at+1:]
-	}
-	if strings.HasPrefix(authority, "[") {
-		end := strings.IndexByte(authority, ']')
-		if end <= 1 {
-			return "", false
+type uriAuthority struct {
+	start int
+	end   int
+	host  string
+}
+
+func uriAuthorities(s string, limit int) []uriAuthority {
+	schemes := uriSchemeInText.FindAllStringIndex(s, limit)
+	out := make([]uriAuthority, 0, len(schemes))
+	for _, loc := range schemes {
+		end := loc[1]
+		for end < len(s) && !uriHardTerminator(s[end]) {
+			end++
 		}
-		return authority[1:end], true
+		host, authorityEnd, ok := uriHost(s[loc[1]:end])
+		if !ok {
+			continue
+		}
+		scheme := s[loc[0] : loc[1]-3]
+		if strings.EqualFold(scheme, "http") || strings.EqualFold(scheme, "https") {
+			host = ""
+		}
+		out = append(out, uriAuthority{start: loc[0], end: loc[1] + authorityEnd, host: host})
 	}
-	if colon := strings.LastIndexByte(authority, ':'); colon >= 0 {
-		authority = authority[:colon]
+	return out
+}
+
+func uriHost(authority string) (string, int, bool) {
+	if sep := strings.IndexAny(authority, ",;"); sep >= 0 {
+		if host, ok := parsedURIHost(authority[:sep]); ok {
+			return host, sep, true
+		}
 	}
-	return authority, authority != ""
+	for search := 0; search < len(authority); {
+		rel := strings.IndexByte(authority[search:], '@')
+		if rel < 0 {
+			break
+		}
+		at := search + rel
+		end := at + 1
+		for end < len(authority) && !uriHostSeparator(authority[end]) {
+			end++
+		}
+		if host, ok := parsedURIHost(authority[at+1 : end]); ok {
+			return host, end, true
+		}
+		search = at + 1
+	}
+	end := 0
+	for end < len(authority) && !uriHostSeparator(authority[end]) {
+		end++
+	}
+	host, ok := parsedURIHost(authority[:end])
+	return host, end, ok
+}
+
+func uriHostSeparator(b byte) bool {
+	switch b {
+	case ',', ';', '&', '\'', '(', ')', '*', '+', '=':
+		return true
+	}
+	return false
+}
+
+func uriHardTerminator(b byte) bool {
+	switch b {
+	case '/', '?', '#', '"', '`', '<', '>', '\\', '{', '}', '|', '^':
+		return true
+	}
+	return b <= ' ' || b >= 0x7f
+}
+
+func parsedURIHost(hostport string) (string, bool) {
+	if hostport == "" || strings.ContainsRune(hostport, '@') {
+		return "", false
+	}
+	u, err := url.Parse("scheme://" + hostport)
+	if err != nil || u.User != nil || u.Host != hostport || u.Hostname() == "" {
+		return "", false
+	}
+	return u.Hostname(), true
 }
 
 // trimTrailingMarkdownEmphasis removes an exact closing bold marker from a
@@ -474,7 +528,21 @@ func trimHostRootDot(host string) string {
 // spaces so their userinfo cannot be reclassified as standalone indicators.
 func blankURLs(s string) string {
 	s = blankMatches(s, urlInText)
-	return blankMatches(s, uriAuthorityInText)
+	return blankURIAuthorities(s)
+}
+
+func blankURIAuthorities(s string) string {
+	matches := uriAuthorities(s, -1)
+	if len(matches) == 0 {
+		return s
+	}
+	b := []byte(s)
+	for _, match := range matches {
+		for i := match.start; i < match.end; i++ {
+			b[i] = ' '
+		}
+	}
+	return string(b)
 }
 
 func blankMatches(s string, re *regexp.Regexp) string {

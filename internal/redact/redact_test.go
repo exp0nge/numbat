@@ -110,15 +110,9 @@ func TestStringMasksURLUserinfo(t *testing.T) {
 		{"redis://user:pa:ss@cache.example/0", "redis://user:***@cache.example/0"},
 		{"amqp://user:p@ss@broker.example/vhost", "amqp://user:***@broker.example/vhost"},
 		{"postgres://user:p!$&'()*+,;=ss@db.example/app", "postgres://user:***@db.example/app"},
+		{"postgres://user:secret@db.example:5432;ops@example.com", "postgres://user:***@db.example:5432;ops@example.com"},
+		{"redis://user:secret@cache.example:6379,admin@example.com", "redis://user:***@cache.example:6379,admin@example.com"},
 		{"https://user:secret@[2001:db8::1]/", "https://user:***@[2001:db8::1]/"},
-		{
-			"https://api.example:8443;user=ops@example.com",
-			"https://api.example:***@example.com",
-		},
-		{
-			"api.example,https://api.example:8443,ops@example.com",
-			"api.example,https://api.example:***@example.com",
-		},
 		{
 			"postgres://a:first@one.example/db redis://b:second@two.example/0",
 			"postgres://a:***@one.example/db redis://b:***@two.example/0",
@@ -147,6 +141,8 @@ func TestStringURLUserinfoMaskRemainsParseable(t *testing.T) {
 
 func TestStringPreservesURLWithoutUserinfo(t *testing.T) {
 	tests := []string{
+		"https://api.example:8443;user=ops@example.com",
+		"api.example,https://api.example:8443,ops@example.com",
 		"https://api.example:8443 then ops@example.com",
 		"https://[2001:db8::1]:8443/",
 	}

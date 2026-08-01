@@ -407,6 +407,24 @@ func TestIndicatorsDSNUserinfoNotMined(t *testing.T) {
 	}
 }
 
+func TestIndicatorsRetainDSNHostBeforeDelimitedProse(t *testing.T) {
+	events := []model.Event{
+		{EventType: model.EventCommandExec, Command: "connect postgres://user:secret@db.example:5432;ops@example.com", EventID: "e1"},
+		{EventType: model.EventCommandExec, Command: "connect redis://user:secret@cache.example:6379,admin@example.com", EventID: "e2"},
+	}
+	inds := Indicators(events)
+	for _, host := range []string{"db.example", "cache.example"} {
+		if findInd(inds, IndicatorDomain, host) == nil {
+			t.Errorf("indicator %q was lost: %+v", host, inds)
+		}
+	}
+	for _, email := range []string{"ops@example.com", "admin@example.com"} {
+		if findInd(inds, IndicatorEmail, email) == nil {
+			t.Errorf("indicator %q was lost: %+v", email, inds)
+		}
+	}
+}
+
 // An uppercase/mixed-case URL scheme must be recognized as a URL so its userinfo
 // is fenced off the standalone miners exactly like a lowercase scheme. Without a
 // case-insensitive scheme match, HTTPS://8.8.8.8@evil.example/x would skip both
