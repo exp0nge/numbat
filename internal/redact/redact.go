@@ -30,6 +30,16 @@ var tokenPatterns = []*regexp.Regexp{
 
 const secretKeyTerm = `(?i:SECRET|TOKEN|PASSWORD|PASSWD|API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY)`
 
+var (
+	uriSchemePattern               = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://`)
+	authorizationCredentialPattern = regexp.MustCompile(
+		`(?i)(^|[^A-Za-z0-9_-])((?:proxy-)?authorization["']?\]?[ \t]*[:=][ \t]*["']?(?:basic|bearer)[ \t]+)([A-Za-z0-9._~+/\-]+=*)`,
+	)
+)
+
+// urlPasswordMask is valid URL userinfo and cannot be mined as an email local part.
+const urlPasswordMask = "***"
+
 // secretKey matches a secret-looking assignment key (env var, JSON field,
 // YAML key). Capture group 1 is the key text as written.
 const secretKey = `([A-Za-z0-9_."'-]*` + secretKeyTerm + `[A-Za-z0-9_."'-]*)`
@@ -72,6 +82,8 @@ const maxCredentialQueryKeyLen = len("x-amz-security-token")
 // patterns are limited to non-URL spans to avoid masking benign query keys such
 // as id_token.
 func String(s string) string {
+	s = maskURLUserinfoPasswords(s)
+	s = maskAuthorizationCredentials(s)
 	s = maskCredentialValues(s)
 	var b strings.Builder
 	last := 0
@@ -86,6 +98,58 @@ func String(s string) string {
 		out = p.ReplaceAllString(out, Mask)
 	}
 	return out
+}
+
+func maskAuthorizationCredentials(s string) string {
+	return authorizationCredentialPattern.ReplaceAllString(s, "${1}${2}"+Mask)
+}
+
+func maskURLUserinfoPasswords(s string) string {
+	var b strings.Builder
+	last := 0
+	for _, loc := range uriSchemePattern.FindAllStringIndex(s, -1) {
+		authorityStart := loc[1]
+		if authorityStart < last {
+			continue
+		}
+		authorityEnd := uriAuthorityEnd(s, authorityStart)
+		at := strings.LastIndexByte(s[authorityStart:authorityEnd], '@')
+		if at < 0 {
+			continue
+		}
+		colon := strings.IndexByte(s[authorityStart:authorityStart+at], ':')
+		if colon < 0 {
+			continue
+		}
+		passwordStart := authorityStart + colon + 1
+		passwordEnd := authorityStart + at
+		if passwordStart >= passwordEnd {
+			continue
+		}
+		b.WriteString(s[last:passwordStart])
+		b.WriteString(urlPasswordMask)
+		last = passwordEnd
+	}
+	if last == 0 {
+		return s
+	}
+	b.WriteString(s[last:])
+	return b.String()
+}
+
+func uriAuthorityEnd(s string, start int) int {
+	for start < len(s) && !uriAuthorityTerminator(s[start]) {
+		start++
+	}
+	return start
+}
+
+func uriAuthorityTerminator(b byte) bool {
+	switch b {
+	case '/', '?', '#', '"', '\'', '`', '<', '>', '\\', '{', '}', '[', ']', '|', '^', ',', ';', '&', '(', ')':
+		return true
+	}
+	return b <= ' ' || b >= 0x7f
 }
 
 // urlPattern matches an http(s) URL substring inside arbitrary text. It is used

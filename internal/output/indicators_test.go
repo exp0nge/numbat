@@ -370,6 +370,30 @@ func TestIndicatorsUserinfoNotMinedAsIPOrHash(t *testing.T) {
 	}
 }
 
+func TestIndicatorsDSNUserinfoNotMined(t *testing.T) {
+	hash := "0123456789abcdef0123456789abcdef"
+	events := []model.Event{
+		{EventType: model.EventCommandExec, Command: "connect postgres://8.8.8.8:secret@db.example/app", EventID: "e1"},
+		{EventType: model.EventCommandExec, Command: "connect redis://" + hash + ":secret@cache.example/0", EventID: "e2"},
+		{EventType: model.EventCommandExec, Command: "connect postgres://user:secret@db.example/app then https://evil.example/x", EventID: "e3"},
+	}
+	inds := Indicators(events)
+	if ind := findInd(inds, IndicatorIPv4, "8.8.8.8"); ind != nil {
+		t.Errorf("DSN username must not be mined as ipv4: %+v", ind)
+	}
+	if ind := findInd(inds, IndicatorMD5, hash); ind != nil {
+		t.Errorf("DSN username must not be mined as md5: %+v", ind)
+	}
+	for _, ind := range inds {
+		if ind.Type == IndicatorEmail {
+			t.Errorf("redacted DSN userinfo must not become an email: %+v", ind)
+		}
+	}
+	if findInd(inds, IndicatorDomain, "evil.example") == nil {
+		t.Errorf("indicator outside DSN was lost: %+v", inds)
+	}
+}
+
 // An uppercase/mixed-case URL scheme must be recognized as a URL so its userinfo
 // is fenced off the standalone miners exactly like a lowercase scheme. Without a
 // case-insensitive scheme match, HTTPS://8.8.8.8@evil.example/x would skip both

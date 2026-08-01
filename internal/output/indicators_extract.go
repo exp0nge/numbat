@@ -46,6 +46,12 @@ const maxExtractedIndicatorsPerField = 256
 // pipeline is captured without trailing pipe/redirect noise.
 var urlInText = regexp.MustCompile(`(?i:https?)://[^\s"'<>` + "`" + `|;)\\]+`)
 
+// uriAuthorityInText fences non-HTTP URI authorities from standalone miners.
+// Credentials and usernames inside a DSN are evidence, not independent IOCs.
+var uriAuthorityInText = regexp.MustCompile(
+	`(?i:[a-z][a-z0-9+.-]*)://[A-Za-z0-9._~!$'*+%:@=-]+`,
+)
+
 // emailInText matches a conservative email address shape. The local part and
 // domain are restricted to the characters that appear in real addresses; the TLD
 // must be at least two letters so a bare `a@b` or a version string is not caught.
@@ -423,11 +429,15 @@ func trimHostRootDot(host string) string {
 	return strings.TrimRight(host, ".")
 }
 
-// blankURLs returns s with every http(s) URL span replaced by spaces of equal
-// length. Offsets are preserved so non-URL spans are unchanged; used to fence the
-// standalone IPv4/hash/email miners off a URL's authority/userinfo (see extractIndicators).
+// blankURLs replaces HTTP URLs and other URI authorities with equal-length
+// spaces so their userinfo cannot be reclassified as standalone indicators.
 func blankURLs(s string) string {
-	locs := urlInText.FindAllStringIndex(s, -1)
+	s = blankMatches(s, urlInText)
+	return blankMatches(s, uriAuthorityInText)
+}
+
+func blankMatches(s string, re *regexp.Regexp) string {
+	locs := re.FindAllStringIndex(s, -1)
 	if len(locs) == 0 {
 		return s
 	}
