@@ -411,14 +411,15 @@ func TestIndicatorsRetainDSNHostBeforeDelimitedProse(t *testing.T) {
 	events := []model.Event{
 		{EventType: model.EventCommandExec, Command: "connect postgres://user:secret@db.example:5432;ops@example.com", EventID: "e1"},
 		{EventType: model.EventCommandExec, Command: "connect redis://user:secret@cache.example:6379,admin@example.com", EventID: "e2"},
+		{EventType: model.EventCommandExec, Command: "connect amqp://user:secret@broker.example:5672&owner@example.com", EventID: "e3"},
 	}
 	inds := Indicators(events)
-	for _, host := range []string{"db.example", "cache.example"} {
+	for _, host := range []string{"db.example", "cache.example", "broker.example"} {
 		if findInd(inds, IndicatorDomain, host) == nil {
 			t.Errorf("indicator %q was lost: %+v", host, inds)
 		}
 	}
-	for _, email := range []string{"ops@example.com", "admin@example.com"} {
+	for _, email := range []string{"ops@example.com", "admin@example.com", "owner@example.com"} {
 		if findInd(inds, IndicatorEmail, email) == nil {
 			t.Errorf("indicator %q was lost: %+v", email, inds)
 		}

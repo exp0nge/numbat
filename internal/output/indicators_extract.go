@@ -219,7 +219,7 @@ func uriAuthorities(s string, limit int) []uriAuthority {
 }
 
 func uriHost(authority string) (string, int, bool) {
-	if sep := strings.IndexAny(authority, ",;"); sep >= 0 {
+	if sep := strings.IndexAny(authority, ",;&"); sep >= 0 {
 		if host, ok := parsedURIHost(authority[:sep]); ok {
 			return host, sep, true
 		}

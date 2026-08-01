@@ -112,6 +112,7 @@ func TestStringMasksURLUserinfo(t *testing.T) {
 		{"postgres://user:p!$&'()*+,;=ss@db.example/app", "postgres://user:***@db.example/app"},
 		{"postgres://user:secret@db.example:5432;ops@example.com", "postgres://user:***@db.example:5432;ops@example.com"},
 		{"redis://user:secret@cache.example:6379,admin@example.com", "redis://user:***@cache.example:6379,admin@example.com"},
+		{"postgres://user:secret@db.example:5432&owner@example.com", "postgres://user:***@db.example:5432&owner@example.com"},
 		{"https://user:secret@[2001:db8::1]/", "https://user:***@[2001:db8::1]/"},
 		{
 			"postgres://a:first@one.example/db redis://b:second@two.example/0",
@@ -143,6 +144,7 @@ func TestStringPreservesURLWithoutUserinfo(t *testing.T) {
 	tests := []string{
 		"https://api.example:8443;user=ops@example.com",
 		"api.example,https://api.example:8443,ops@example.com",
+		"https://api.example:8443&user=ops@example.com",
 		"https://api.example:8443 then ops@example.com",
 		"https://[2001:db8::1]:8443/",
 	}

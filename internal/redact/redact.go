@@ -180,7 +180,7 @@ func validURIHost(hostport string) bool {
 // dotted/IP host requirement avoids treating an ordinary user:digits password
 // as a completed network authority.
 func completeHostPortBeforeSeparator(beforeAt string) bool {
-	sep := strings.IndexAny(beforeAt, ",;")
+	sep := strings.IndexAny(beforeAt, ",;&")
 	if sep < 0 {
 		return false
 	}
