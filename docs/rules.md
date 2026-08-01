@@ -1,8 +1,8 @@
 # Writing rules
 
 Each numbat rule is one YAML file with [CEL](https://cel.dev/) boolean
-expressions. It evaluates either one normalized event or an ordered sequence
-of events.
+expressions. It evaluates either one [normalized event](event-model.md) or an
+ordered sequence of events.
 
 Rule expressions can use:
 
@@ -152,6 +152,10 @@ Action types are alternatives, not layers. A recognized shell action is a
 actions are specialized the same way. `tool.call` is the fallback when numbat
 cannot safely specialize the action. A later `command.result` is the correlated
 outcome, not a second invocation.
+
+Long-running commands may produce multiple `command.result` updates with the
+same `tool_call_id`. A missing `exit_code` means the source did not report one;
+it does not imply success.
 
 Do not add `tool.call` as a catch-all branch to a command rule. Generic tool
 calls have no `event.command`; write a separate tool rule only when the generic

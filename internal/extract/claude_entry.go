@@ -51,6 +51,7 @@ type claudeEntry struct {
 	AgentID       string          `json:"agentId"`
 	Timestamp     string          `json:"timestamp"`
 	CWD           string          `json:"cwd"`
+	RelocatedCWD  string          `json:"relocatedCwd"`
 	Message       claudeMessage   `json:"message"`
 	ToolUseResult json.RawMessage `json:"toolUseResult"`
 	// Session-context header fields Claude Code stamps on transcript entries: the

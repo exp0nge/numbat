@@ -125,6 +125,7 @@ type claudeState struct {
 	startIdx        int
 	lastTimestamp   string
 	lastLine        int
+	projectPath     string
 	permissionModes map[string]string
 	// commandCallIDs is the set of tool_use ids that were a Bash command.exec, so
 	// a later tool_result correlated by tool_use_id can be promoted from a generic
@@ -168,6 +169,11 @@ func (st *claudeState) permissionModeChanged(pointer, mode string) bool {
 // last-observed timestamp/line so the eventual session.end points at the close
 // of the artifact.
 func (st *claudeState) observe(res *Result, e ClaudeExtractor, src Source, sha string, line int, entry *claudeEntry) {
+	if entry.CWD != "" {
+		st.projectPath = entry.CWD
+	} else {
+		entry.CWD = st.projectPath
+	}
 	if entry.Timestamp != "" {
 		st.lastTimestamp = entry.Timestamp
 	}
@@ -264,6 +270,9 @@ func (e ClaudeExtractor) mapLine(res *Result, src Source, sha string, st *claude
 		res.diag(src.Path, line, "malformed JSON line")
 		return
 	}
+	if entry.Type == "relocated" {
+		entry.CWD = entry.RelocatedCWD
+	}
 	st.observe(res, e, src, sha, line, &entry)
 	switch entry.Type {
 	case "user":
@@ -283,17 +292,15 @@ func (e ClaudeExtractor) mapLine(res *Result, src Source, sha string, st *claude
 		e.mapAgentName(res, src, sha, line, st, &entry)
 	case "attachment":
 		e.mapAttachment(res, src, sha, line, &entry)
-	case "summary", "system", "ai-title", "queue-operation",
+	case "summary", "system", "ai-title", "custom-title", "queue-operation", "relocated",
 		"last-prompt", "file-history-snapshot", "file-history-delta", "worktree-state":
 		// Metadata and noise, not agent activity: "last-prompt" duplicates the
 		// most recent user prompt already captured as a "user" entry (surfacing
 		// it would double-count); file-history entries are editor backup
 		// bookkeeping, not separate tool-driven file changes;
 		// "worktree-state" is git-worktree bookkeeping for Claude Code's worktree
-		// feature, carrying no normalized activity. They are recognized
-		// explicitly so a forensic read stays quiet rather than emitting a warn
-		// per line; the schema reserves room to surface them later without a
-		// model change.
+		// feature; title and relocation records describe the transcript itself.
+		// Recognizing them keeps diagnostics focused on real coverage gaps.
 	default:
 		res.diag(src.Path, line, "unhandled entry type")
 	}

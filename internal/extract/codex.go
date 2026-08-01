@@ -25,20 +25,16 @@ const artifactCodexRollout = "codex_rollout"
 //
 // See codex-rs/protocol/src/protocol.rs for the persisted rollout variants.
 //
-// Two layers persist the same activity: a user prompt is written BOTH as a
-// response_item message AND as an event_msg user_message; an apply_patch shows
-// up as a function_call AND a patch_apply_end. To avoid double-counting the
-// timeline, numbat treats the response_item layer as canonical (it is the raw
-// model I/O) and emits from event_msg only the records with no response_item
-// equivalent that still carry forensic signal — a turn that aborted and history
-// that was rolled back. This mirrors the persistence policy in
-// codex-rs/rollout/src/policy.rs, where both layers are written to disk.
+// Tool activity and assistant messages come from response_item. Human prompts
+// prefer the explicit user_message lifecycle record (or paginated UserMessage
+// item), because Codex also stores injected context as role=user response
+// items. Older response-only artifacts retain that role-based fallback. Other
+// duplicate event_msg records are skipped.
 //
-// Codex rollouts are append-only and event-ordered: unlike Gemini, the file is
-// not a mutable history that must be replayed into a canonical conversation, so
-// numbat walks it line by line like the Claude transcript parser. session_meta
-// and turn_context update the running session identity / working directory that
-// later events inherit but are not themselves emitted as events.
+// Codex rollouts are append-only and event-ordered. Forked rollouts may copy the
+// parent's history after the child session_meta; numbat skips that replay until
+// the first child task boundary. session_meta and turn_context update the
+// running identity and working directory but are not themselves emitted.
 //
 // The zero value is ready to use. maxBytes overrides the artifact size cap and
 // exists for tests; production callers use the zero value (the default cap).
@@ -56,6 +52,17 @@ func (CodexExtractor) Agent() string { return model.AgentCodex }
 type codexState struct {
 	sessionID   string
 	projectPath string
+	metaSeen    bool
+	// forkReplay suppresses copied parent records until a task_started UUID
+	// ordered after the child thread UUID marks the first child turn.
+	forkReplay    bool
+	forkSessionID [16]byte
+	// forkUnreadableLine records the first unreadable replay row so one
+	// diagnostic reports possible omission on recovery or at EOF.
+	forkUnreadableLine int
+	// forkUnorderedLine records a valid legacy task UUID. Current Codex uses
+	// ordered UUIDv7 turn IDs; a fork with only legacy IDs is ambiguous at EOF.
+	forkUnorderedLine int
 	// startIdx is the index of the synthetic session.start event in res.Events,
 	// valid only when started is set, so session.end can mirror its identity.
 	started  bool
@@ -65,15 +72,23 @@ type codexState struct {
 	// the opener's timestamp and provenance.
 	lastTimestamp string
 	lastLine      int
+	// explicitUserMessages marks rollouts with user-facing lifecycle records.
+	// responsePromptIDs tracks the older response-item fallback so injected
+	// context can be discarded when an explicit source appears. A headered
+	// rollout holds its latest role=user item until its lifecycle record arrives,
+	// preserving the prompt if the artifact ends between writes.
+	explicitUserMessages  bool
+	userPromptExpected    bool
+	responsePromptIDs     map[string]struct{}
+	pendingResponsePrompt *model.Event
 	// shellCallIDs is the set of call_ids that were a shell command.exec (a
 	// local_shell_call or a shell/shell_command/exec_command function_call), so
 	// the paired function_call_output is promoted from tool.result to
 	// command.result. A non-shell call's id never enters the set.
 	shellCallIDs map[string]struct{}
-	// codeModeShellCallIDs records custom exec cells that were safely reduced to
-	// one command.exec, so only their custom_tool_call_output becomes a
-	// command.result. Keeping the sets separate prevents cross-variant collisions.
-	codeModeShellCallIDs map[string]struct{}
+	// codeMode correlates static exec cells through Codex's internal wait/poll
+	// calls so long-running commands keep one semantic identity.
+	codeMode codexCodeModeTracker
 	// failedMCPCallIDs is the set of call_ids whose mcp_tool_call_end recorded a
 	// structured failure. A custom_tool_call_output emitted AFTER its end-event
 	// consults this so it still carries the tool-error signal regardless of the
@@ -93,9 +108,10 @@ func (st *codexState) noteFailedMCPCall(id string) {
 	st.failedMCPCallIDs[id] = struct{}{}
 }
 
-// isFailedMCPCall reports whether call_id's mcp_tool_call_end reported failure.
-func (st *codexState) isFailedMCPCall(id string) bool {
+// takeFailedMCPCall consumes a deferred MCP failure for a tool result.
+func (st *codexState) takeFailedMCPCall(id string) bool {
 	_, ok := st.failedMCPCallIDs[id]
+	delete(st.failedMCPCallIDs, id)
 	return ok
 }
 
@@ -111,30 +127,17 @@ func (st *codexState) noteShellCall(id string) {
 	st.shellCallIDs[id] = struct{}{}
 }
 
-// isShellCall reports whether call_id was a recorded shell command.exec.
-func (st *codexState) isShellCall(id string) bool {
+// takeShellCall consumes the command owner for a function-call output.
+func (st *codexState) takeShellCall(id string) bool {
 	_, ok := st.shellCallIDs[id]
+	delete(st.shellCallIDs, id)
 	return ok
 }
 
-func (st *codexState) noteCodeModeShellCall(id string) {
-	if id == "" {
-		return
-	}
-	if st.codeModeShellCallIDs == nil {
-		st.codeModeShellCallIDs = map[string]struct{}{}
-	}
-	st.codeModeShellCallIDs[id] = struct{}{}
-}
-
-func (st *codexState) forgetCodeModeShellCall(id string) {
-	delete(st.codeModeShellCallIDs, id)
-}
-
-func (st *codexState) takeCodeModeShellCall(id string) bool {
-	_, ok := st.codeModeShellCallIDs[id]
-	delete(st.codeModeShellCallIDs, id)
-	return ok
+func (st *codexState) resetCall(id string) {
+	delete(st.shellCallIDs, id)
+	delete(st.failedMCPCallIDs, id)
+	st.codeMode.forgetCall(id)
 }
 
 // Extract parses a Codex rollout file. It reads the whole artifact to stamp a
@@ -173,10 +176,17 @@ func (e CodexExtractor) Extract(r io.Reader, src Source) (*Result, error) {
 	for line := 1; ; line++ {
 		raw, tooLong, err := readLine(br)
 		if tooLong {
-			res.diag(src.Path, line, "line exceeds size cap; skipped")
+			if st.forkReplay {
+				if st.forkUnreadableLine == 0 {
+					st.forkUnreadableLine = line
+				}
+			} else {
+				res.diag(src.Path, line, "line exceeds size cap; skipped")
+			}
 			if errors.Is(err, io.EOF) {
 				// A truncated final line still ends the stream: close the session
 				// so a capped rollout is not left with a start and no end.
+				flushCodexResponsePrompt(res, st)
 				e.emitSessionEnd(res, src, sha, st)
 				return res, nil
 			}
@@ -188,6 +198,7 @@ func (e CodexExtractor) Extract(r io.Reader, src Source) (*Result, error) {
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				flushCodexResponsePrompt(res, st)
 				e.emitSessionEnd(res, src, sha, st)
 				return res, nil
 			}
@@ -203,6 +214,11 @@ func (e CodexExtractor) Extract(r io.Reader, src Source) (*Result, error) {
 // closing record to point a JSONPointer at, so the end carries artifact-level
 // evidence (path/line/hash) with an empty pointer.
 func (e CodexExtractor) emitSessionEnd(res *Result, src Source, sha string, st *codexState) {
+	if st.forkReplay && st.forkUnreadableLine > 0 {
+		res.diag(src.Path, st.forkUnreadableLine, "fork replay ended without a valid child task boundary after an unreadable record; child activity may be omitted")
+	} else if st.forkReplay && st.forkUnorderedLine > 0 {
+		res.diag(src.Path, st.forkUnorderedLine, "fork replay ended without an orderable child task boundary; child activity may be omitted")
+	}
 	if !st.started {
 		return
 	}
@@ -226,8 +242,40 @@ func (e CodexExtractor) emitSessionEnd(res *Result, src Source, sha string, st *
 func (e CodexExtractor) mapLine(res *Result, src Source, sha string, st *codexState, line int, raw []byte) {
 	var rl codexLine
 	if err := json.Unmarshal(raw, &rl); err != nil {
-		res.diag(src.Path, line, "malformed JSON line")
+		if st.forkReplay {
+			if st.forkUnreadableLine == 0 {
+				st.forkUnreadableLine = line
+			}
+		} else {
+			res.diag(src.Path, line, "malformed JSON line")
+		}
 		return
+	}
+	if st.forkReplay {
+		switch codexForkReplayBoundary(rl, st.forkSessionID) {
+		case codexForkBoundaryUnreadable:
+			if st.forkUnreadableLine == 0 {
+				st.forkUnreadableLine = line
+			}
+			return
+		case codexForkBoundaryUnordered:
+			if st.forkUnorderedLine == 0 {
+				st.forkUnorderedLine = line
+			}
+			return
+		case codexForkBoundaryChild:
+			// Continue below so the boundary line still updates parser state.
+		default:
+			return
+		}
+		if st.forkUnreadableLine > 0 {
+			res.diag(src.Path, st.forkUnreadableLine, "unreadable record while excluding copied fork history; activity before the child task boundary may be omitted")
+			st.forkUnreadableLine = 0
+		}
+		st.forkReplay = false
+	}
+	if st.pendingResponsePrompt != nil && !codexUserPromptContinuation(rl) {
+		st.pendingResponsePrompt = nil
 	}
 	if rl.Timestamp != "" {
 		st.lastTimestamp = rl.Timestamp
@@ -264,11 +312,21 @@ func (e CodexExtractor) applySessionMeta(res *Result, src Source, sha string, st
 		res.diag(src.Path, line, "malformed session_meta payload")
 		return
 	}
+	firstMeta := !st.metaSeen
+	st.metaSeen = true
 	if st.sessionID == "" {
 		st.sessionID = meta.ID
 	}
 	if st.projectPath == "" {
 		st.projectPath = meta.Cwd
+	}
+	if firstMeta && meta.ForkedFromID != "" {
+		if id, ok := codexUUIDv7(meta.ID); ok {
+			st.forkReplay = true
+			st.forkSessionID = id
+		} else {
+			res.diag(src.Path, line, "forked session id is not UUIDv7; replay filtering disabled")
+		}
 	}
 	if st.started {
 		return
@@ -291,6 +349,39 @@ func (e CodexExtractor) applySessionMeta(res *Result, src Source, sha string, st
 	st.startIdx = len(res.Events)
 	st.started = true
 	res.Events = append(res.Events, ev)
+}
+
+type codexForkBoundary uint8
+
+const (
+	codexForkBoundaryNone codexForkBoundary = iota
+	codexForkBoundaryChild
+	codexForkBoundaryUnreadable
+	codexForkBoundaryUnordered
+)
+
+func codexForkReplayBoundary(line codexLine, sessionID [16]byte) codexForkBoundary {
+	if line.Type != codexTypeEventMsg {
+		return codexForkBoundaryNone
+	}
+	var event codexEventMsg
+	if json.Unmarshal(line.Payload, &event) != nil {
+		return codexForkBoundaryUnreadable
+	}
+	if event.Type != codexEMTaskStarted {
+		return codexForkBoundaryNone
+	}
+	turnID, ok := codexUUIDv7(event.TurnID)
+	if !ok {
+		if _, valid := codexUUID(event.TurnID); valid {
+			return codexForkBoundaryUnordered
+		}
+		return codexForkBoundaryUnreadable
+	}
+	if bytes.Compare(turnID[:], sessionID[:]) > 0 {
+		return codexForkBoundaryChild
+	}
+	return codexForkBoundaryNone
 }
 
 // applyTurnContext refreshes the working directory from a turn_context line.
@@ -322,8 +413,13 @@ func (e CodexExtractor) mapResponseItem(res *Result, src Source, sha string, st 
 	case codexRIMessage:
 		e.emitMessage(res, src, sha, st, line, ts, &ri)
 	case codexRIFunctionCall:
+		st.resetCall(ri.CallID)
+		if ri.Name == codexToolWait && ri.Namespace == "" && st.codeMode.noteWait(ri.CallID, string(ri.Arguments)) {
+			return
+		}
 		e.emitFunctionCall(res, src, sha, st, line, ts, &ri)
 	case codexRILocalShellCall:
+		st.resetCall(ri.CallID)
 		ev := e.base(src, sha, st, line, ts, 0)
 		ev.Actor = model.ActorAssistant
 		ev.Confidence = model.ConfidenceHigh
@@ -335,24 +431,27 @@ func (e CodexExtractor) mapResponseItem(res *Result, src Source, sha string, st 
 		st.noteShellCall(ri.CallID)
 		res.Events = append(res.Events, ev)
 	case codexRICustomToolCall:
-		// A later custom call reusing a malformed call id owns its next output.
-		st.forgetCodeModeShellCall(ri.CallID)
-		if ri.Name == codexToolApplyPatch {
+		// A new call owns a reused id and its next output.
+		st.resetCall(ri.CallID)
+		if ri.Namespace == "" && ri.Name == codexToolApplyPatch {
 			e.emitApplyPatchCall(res, src, sha, st, line, ts, ri.Name, ri.CallID, string(ri.Input), "/payload/input")
 			return
 		}
-		if ri.Name == codexToolCodeModeExec {
-			if command, ok := codexCodeModeExecCommand(string(ri.Input)); ok {
+		if ri.Namespace == "" && ri.Name == codexToolCodeModeExec {
+			if call, ok := parseCodexCodeModeExec(string(ri.Input)); ok {
 				ev := e.base(src, sha, st, line, ts, 0)
 				ev.Actor = model.ActorAssistant
 				ev.Confidence = model.ConfidenceHigh
 				ev.ToolName = codexToolExecCommand
 				ev.ToolCallID = ri.CallID
 				ev.EventType = model.EventCommandExec
-				ev.Command = command
+				ev.Command = call.command
 				ev.Evidence.JSONPointer = "/payload/input"
-				st.noteCodeModeShellCall(ri.CallID)
+				st.codeMode.noteExec(ri.CallID, call.resultKind)
 				res.Events = append(res.Events, ev)
+				return
+			}
+			if st.codeMode.noteWriteStdinPoll(ri.CallID, string(ri.Input)) {
 				return
 			}
 		}
@@ -389,38 +488,57 @@ func (e CodexExtractor) mapResponseItem(res *Result, src Source, sha string, st 
 		ev.Actor = model.ActorTool
 		ev.Confidence = model.ConfidenceHigh
 		ev.ToolCallID = ri.CallID
-		ev.ContentPreview = preview(decodeCodexOutput(ri.Output))
+		resultBody := decodeCodexOutput(ri.Output)
 		ev.Evidence.JSONPointer = "/payload/output"
-		// An output paired by call_id with the matching shell-call variant is a
-		// command.result. Other function/custom outputs stay tool.result.
+		// Outputs correlated to a shell call are command.result updates. Static
+		// code-mode calls may traverse internal wait/write_stdin calls; those are
+		// folded back into the original command identity.
 		//
-		// A shell command.result's ExitCode stays nil: Codex serializes a
-		// function_call_output as only its body (FunctionCallOutputPayload in
-		// protocol/src/models.rs drops the internal success flag and writes no
-		// structured exit code — the code appears only as a free-text
-		// "Exit code: N" line in the body, too brittle to lift), and the structured
-		// ExecCommandEnd carrying the real code is not persisted to the rollout. So
-		// there is no faithful structured shell exit status to attach, and numbat
-		// never scrapes the prose body for one. The shell tool-error signal is
-		// likewise unrecoverable at rest: local_shell_call's status enum is
-		// Completed|InProgress|Incomplete with no failure variant (Incomplete is an
-		// abort/limit, not a tool error). See
-		// TestExtractCodexShellResultHasNoStructuredExitOrError.
+		// Legacy shell outputs persist only prose, so their exit status remains
+		// unset. Current code-mode outputs can carry the exec helper's structured
+		// result; decode it only when the statically parsed cell forwarded that
+		// object, never by interpreting JSON-looking stdout.
 		//
 		// An MCP tool failure, by contrast, IS recoverable: the persisted
 		// mcp_tool_call_end carries a structured Result keyed by this call_id, and
 		// mapEventMsg stamps TagToolError on this tool.result when it records a
 		// failure. When the end-event already arrived (it preceded this output), the
 		// failure was recorded in state, so tag here too.
-		if (ri.Type == codexRIFunctionCallOutput && st.isShellCall(ri.CallID)) ||
-			(ri.Type == codexRICustomToolCallOut && st.takeCodeModeShellCall(ri.CallID)) {
+		var codeModeRef codexCodeModeResultRef
+		var codeModeResult bool
+		switch ri.Type {
+		case codexRICustomToolCallOut:
+			codeModeRef, codeModeResult = st.codeMode.takeCustomCall(ri.CallID)
+		case codexRIFunctionCallOutput:
+			codeModeRef, codeModeResult = st.codeMode.takeWaitCall(ri.CallID)
+		}
+		shellResult := ri.Type == codexRIFunctionCallOutput && st.takeShellCall(ri.CallID)
+		if codeModeResult || shellResult {
 			ev.EventType = model.EventCommandResult
+			if codeModeResult {
+				ev.ToolName = codexToolExecCommand
+				outcome := st.codeMode.trackOutcome(codeModeRef, ri.Output)
+				if outcome.cellID != "" {
+					return
+				}
+				ev.ToolCallID = codeModeRef.commandCallID
+				resultBody = outcome.output
+				ev.ExitCode = outcome.exitCode
+				ev.DurationMs = outcome.durationMs
+				if outcome.toolError {
+					ev.Tags = append(ev.Tags, model.TagToolError)
+				}
+				if !outcome.recognized {
+					res.diag(src.Path, line, "unrecognized code-mode result envelope")
+				}
+			}
 		} else {
 			ev.EventType = model.EventToolResult
-			if st.isFailedMCPCall(ri.CallID) {
+			if st.takeFailedMCPCall(ri.CallID) {
 				ev.Tags = append(ev.Tags, model.TagToolError)
 			}
 		}
+		ev.ContentPreview = preview(resultBody)
 		res.Events = append(res.Events, ev)
 	case codexRIToolSearchOutput:
 		// The result of a tool_search_call (the model discovering which tools
@@ -523,6 +641,15 @@ func (e CodexExtractor) emitMessage(res *Result, src Source, sha string, st *cod
 	ev.Evidence.JSONPointer = "/payload/content"
 	switch ri.Role {
 	case "user":
+		if st.metaSeen || st.explicitUserMessages {
+			if !st.explicitUserMessages || st.userPromptExpected {
+				ev.EventType = model.EventPromptUser
+				ev.Actor = model.ActorUser
+				ev.Confidence = model.ConfidenceMedium
+				st.pendingResponsePrompt = &ev
+			}
+			return
+		}
 		ev.EventType = model.EventPromptUser
 		ev.Actor = model.ActorUser
 	case "assistant":
@@ -534,6 +661,12 @@ func (e CodexExtractor) emitMessage(res *Result, src Source, sha string, st *cod
 		return
 	}
 	res.Events = append(res.Events, ev)
+	if ri.Role == "user" {
+		if st.responsePromptIDs == nil {
+			st.responsePromptIDs = map[string]struct{}{}
+		}
+		st.responsePromptIDs[ev.EventID] = struct{}{}
+	}
 }
 
 // emitFunctionCall maps a response_item function_call onto the normalized event
@@ -543,8 +676,8 @@ func (e CodexExtractor) emitMessage(res *Result, src Source, sha string, st *cod
 // several files, each emitted as its own file.write so the patched paths are
 // first-class. Unknown tools fall back to a generic tool.call.
 func (e CodexExtractor) emitFunctionCall(res *Result, src Source, sha string, st *codexState, line int, ts string, ri *codexResponseItem) {
-	switch ri.Name {
-	case codexToolShell, codexToolShellCommand, codexToolExecCommand:
+	switch {
+	case ri.Namespace == "" && (ri.Name == codexToolShell || ri.Name == codexToolShellCommand || ri.Name == codexToolExecCommand):
 		ev := e.base(src, sha, st, line, ts, 0)
 		ev.Actor = model.ActorAssistant
 		ev.Confidence = model.ConfidenceHigh
@@ -555,9 +688,9 @@ func (e CodexExtractor) emitFunctionCall(res *Result, src Source, sha string, st
 		ev.Evidence.JSONPointer = "/payload/arguments"
 		st.noteShellCall(ri.CallID)
 		res.Events = append(res.Events, ev)
-	case codexToolApplyPatch:
+	case ri.Namespace == "" && ri.Name == codexToolApplyPatch:
 		e.emitApplyPatchCall(res, src, sha, st, line, ts, ri.Name, ri.CallID, string(ri.Arguments), "/payload/arguments")
-	case codexToolReadFile:
+	case ri.Namespace == "" && ri.Name == codexToolReadFile:
 		ev := e.base(src, sha, st, line, ts, 0)
 		ev.Actor = model.ActorAssistant
 		ev.Confidence = model.ConfidenceHigh
@@ -567,7 +700,7 @@ func (e CodexExtractor) emitFunctionCall(res *Result, src Source, sha string, st
 		ev.FilePath = codexArgString(string(ri.Arguments), "path")
 		ev.Evidence.JSONPointer = "/payload/arguments"
 		res.Events = append(res.Events, ev)
-	case codexToolWriteFile, codexToolEditFile:
+	case ri.Namespace == "" && (ri.Name == codexToolWriteFile || ri.Name == codexToolEditFile):
 		ev := e.base(src, sha, st, line, ts, 0)
 		ev.Actor = model.ActorAssistant
 		ev.Confidence = model.ConfidenceHigh
@@ -650,13 +783,8 @@ func (e CodexExtractor) emitApplyPatchCall(res *Result, src Source, sha string, 
 	}
 }
 
-// mapEventMsg decodes an event_msg payload's inner discriminator and emits only
-// the records the response_item layer does not carry: a turn that aborted
-// (interrupted/replaced/budget-limited), history that was rolled back, and the
-// review-mode / thread-goal state transitions that have no response_item twin.
-// All are low-confidence system notes tagged with the record type so the signal
-// is visible rather than a silent gap. Every other event_msg type duplicates a
-// response_item record and is skipped.
+// mapEventMsg decodes the explicit user prompt, structured MCP outcome, and
+// state transitions that are not safely recoverable from response_item alone.
 func (e CodexExtractor) mapEventMsg(res *Result, src Source, sha string, st *codexState, line int, ts string, payload json.RawMessage) {
 	var em codexEventMsg
 	if err := json.Unmarshal(payload, &em); err != nil {
@@ -664,6 +792,14 @@ func (e CodexExtractor) mapEventMsg(res *Result, src Source, sha string, st *cod
 		return
 	}
 	switch em.Type {
+	case codexEMUserMessage:
+		e.emitUserPrompt(res, src, sha, st, line, ts, em.Message, "/payload/message")
+	case codexEMItemCompleted:
+		if message, ok := decodeCodexCompletedUserMessage(em.Item); ok {
+			e.emitUserPrompt(res, src, sha, st, line, ts, message, "/payload/item/content")
+		}
+	case codexEMTaskStarted:
+		st.userPromptExpected = true
 	case codexEMTurnAborted:
 		ev := e.base(src, sha, st, line, ts, 0)
 		ev.EventType = model.EventMessageAssistant
@@ -716,8 +852,8 @@ func (e CodexExtractor) mapEventMsg(res *Result, src Source, sha string, st *cod
 			}
 		}
 	default:
-		// user_message/agent_message/patch_apply_end/... all duplicate a
-		// response_item record; skip to keep the timeline single-counted.
+		// agent_message/patch_apply_end/... duplicate response_item records; skip
+		// them to keep the timeline single-counted.
 		// Unknown/unpersisted types are skipped too.
 		//
 		// No permission.requested/approved/denied is emitted here: the rollout does
@@ -730,6 +866,64 @@ func (e CodexExtractor) mapEventMsg(res *Result, src Source, sha string, st *cod
 		// permission.* vocabulary therefore stays reserved for a future on-disk
 		// signal rather than being synthesized from a heuristic.
 	}
+}
+
+// emitUserPrompt maps the explicit user-facing lifecycle record. Codex uses
+// user_message in legacy histories and item_completed/UserMessage in paginated
+// histories; role=user response items are not sufficient proof of human input.
+func (e CodexExtractor) emitUserPrompt(res *Result, src Source, sha string, st *codexState, line int, ts, message, pointer string) {
+	st.pendingResponsePrompt = nil
+	st.userPromptExpected = false
+	if !st.explicitUserMessages {
+		st.explicitUserMessages = true
+		startID := ""
+		if st.started && st.startIdx < len(res.Events) {
+			startID = res.Events[st.startIdx].EventID
+		}
+		res.Events = discardResponsePromptEvents(res.Events, st.responsePromptIDs)
+		if startID != "" {
+			for i := range res.Events {
+				if res.Events[i].EventID == startID {
+					st.startIdx = i
+					break
+				}
+			}
+		}
+		st.responsePromptIDs = nil
+	}
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return
+	}
+	ev := e.base(src, sha, st, line, ts, 0)
+	ev.EventType = model.EventPromptUser
+	ev.Actor = model.ActorUser
+	ev.Confidence = model.ConfidenceHigh
+	ev.ContentPreview = preview(message)
+	ev.Evidence.JSONPointer = pointer
+	res.Events = append(res.Events, ev)
+}
+
+func flushCodexResponsePrompt(res *Result, st *codexState) {
+	if st.pendingResponsePrompt == nil {
+		return
+	}
+	res.Events = append(res.Events, *st.pendingResponsePrompt)
+	st.pendingResponsePrompt = nil
+}
+
+func discardResponsePromptEvents(events []model.Event, ids map[string]struct{}) []model.Event {
+	if len(ids) == 0 {
+		return events
+	}
+	out := events[:0]
+	for _, ev := range events {
+		if _, discard := ids[ev.EventID]; discard {
+			continue
+		}
+		out = append(out, ev)
+	}
+	return out
 }
 
 // markToolResultError stamps TagToolError on the already-emitted tool.result

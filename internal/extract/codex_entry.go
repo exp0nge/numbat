@@ -46,16 +46,16 @@ const (
 	codexRIContextCompaction = "context_compaction"
 )
 
-// Codex event_msg inner payload types numbat surfaces. The conversation and
-// tool timeline is taken from the response_item layer (the Responses API
-// ground truth); from event_msg numbat emits only records that have no
-// response_item equivalent and carry distinct forensic signal: a turn that was
-// aborted, and history that was rolled back. Everything else in event_msg
-// (user_message/agent_message/patch_apply_end/...) duplicates a response_item
-// record and is intentionally skipped to avoid double-counting the timeline.
+// Codex event_msg types numbat interprets: explicit user prompts, distinct
+// state changes, structured MCP outcomes, and fork boundaries.
 const (
+	codexEMUserMessage      = "user_message"
+	codexEMItemStarted      = "item_started"
+	codexEMItemCompleted    = "item_completed"
 	codexEMTurnAborted      = "turn_aborted"
 	codexEMThreadRolledBack = "thread_rolled_back"
+	// task_started is a fork replay boundary, not an emitted timeline event.
+	codexEMTaskStarted = "task_started"
 	// Persisted event_msg lifecycle/state transitions with NO response_item
 	// twin (verified against policy.rs should_persist_event_msg). Unlike
 	// user_message/agent_message/patch_apply_end — which duplicate a
@@ -86,6 +86,7 @@ const (
 	codexToolWriteFile    = "create_file"
 	codexToolEditFile     = "edit_file"
 	codexToolCodeModeExec = "exec"
+	codexToolWait         = "wait"
 	codexToolUpdatePlan   = "update_plan"
 	codexToolSearch       = "tool_search"
 	codexToolImage        = "image_generation"
@@ -106,15 +107,42 @@ type codexLine struct {
 	Payload   json.RawMessage `json:"payload"`
 }
 
-// codexSessionMeta is the first-line metadata: thread id, working directory,
-// and (flattened) git info. Only the fields numbat maps are decoded.
+// codexSessionMeta is the first-line metadata: thread identity, fork lineage,
+// working directory, and runtime details. Only fields numbat uses are decoded.
 type codexSessionMeta struct {
 	ID            string `json:"id"`
+	ForkedFromID  string `json:"forked_from_id"`
 	Timestamp     string `json:"timestamp"`
 	Cwd           string `json:"cwd"`
 	Originator    string `json:"originator"`
 	CliVersion    string `json:"cli_version"`
 	ModelProvider string `json:"model_provider"`
+}
+
+func codexUUID(id string) ([16]byte, bool) {
+	var uuid [16]byte
+	if len(id) != 36 || id[8] != '-' || id[13] != '-' || id[18] != '-' || id[23] != '-' {
+		return uuid, false
+	}
+	compact := id[:8] + id[9:13] + id[14:18] + id[19:23] + id[24:]
+	decoded, err := hex.DecodeString(compact)
+	if err != nil || len(decoded) != len(uuid) {
+		return uuid, false
+	}
+	copy(uuid[:], decoded)
+	version := uuid[6] >> 4
+	if uuid[8]&0xc0 != 0x80 || version == 0 || version > 8 {
+		return [16]byte{}, false
+	}
+	return uuid, true
+}
+
+func codexUUIDv7(id string) ([16]byte, bool) {
+	uuid, ok := codexUUID(id)
+	if !ok || uuid[6]>>4 != 7 {
+		return [16]byte{}, false
+	}
+	return uuid, true
 }
 
 // codexTurnContext carries the per-turn working directory. One turn_context is
@@ -212,14 +240,13 @@ type codexLocalShellAction struct {
 	Command []string `json:"command"`
 }
 
-// codexEventMsg is the tolerant view of an event_msg payload's inner
-// discriminator plus the fields of the few variants numbat surfaces. CallID and
-// Result are read only from an mcp_tool_call_end: they carry the structured MCP
-// outcome correlated back to the response_item layer by call_id.
+// codexEventMsg is the tolerant view of the event_msg variants numbat uses.
 type codexEventMsg struct {
-	Type   string `json:"type"`
-	TurnID string `json:"turn_id"`
-	Reason string `json:"reason"`
+	Type    string          `json:"type"`
+	TurnID  string          `json:"turn_id"`
+	Reason  string          `json:"reason"`
+	Message string          `json:"message"`
+	Item    json.RawMessage `json:"item"`
 	// CallID joins an mcp_tool_call_end to the custom_tool_call(_output) the
 	// response_item layer already emitted for the same MCP invocation.
 	CallID string `json:"call_id"`
@@ -228,6 +255,44 @@ type codexEventMsg struct {
 	// codexMcpResultIsError; left raw here so a shape numbat does not recognize is
 	// tolerated rather than failing the whole event_msg decode.
 	Result json.RawMessage `json:"result"`
+}
+
+type codexTurnItem struct {
+	Type    string             `json:"type"`
+	Content []codexContentItem `json:"content"`
+}
+
+func decodeCodexCompletedUserMessage(raw json.RawMessage) (string, bool) {
+	var item codexTurnItem
+	if json.Unmarshal(raw, &item) != nil || item.Type != "UserMessage" {
+		return "", false
+	}
+	parts := make([]string, 0, len(item.Content))
+	for _, content := range item.Content {
+		if content.Type == "text" {
+			parts = append(parts, content.Text)
+		}
+	}
+	return strings.Join(parts, ""), true
+}
+
+func codexUserPromptContinuation(line codexLine) bool {
+	if line.Type != codexTypeEventMsg {
+		return false
+	}
+	var event codexEventMsg
+	if json.Unmarshal(line.Payload, &event) != nil {
+		return true
+	}
+	switch event.Type {
+	case codexEMUserMessage:
+		return true
+	case codexEMItemStarted, codexEMItemCompleted:
+		var item codexTurnItem
+		return json.Unmarshal(event.Item, &item) == nil && item.Type == "UserMessage"
+	default:
+		return false
+	}
 }
 
 // codexMcpResultIsError reports whether an mcp_tool_call_end's result records a

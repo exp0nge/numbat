@@ -789,7 +789,7 @@ func TestAgentsHonorAgentHomeOverrides(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(copilotHome, "session-state", "s1", "events.jsonl"), []byte("{}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	openCodeRecord := filepath.Join(opencodeData, "opencode", "storage", "session", "p1", "s1.json")
+	openCodeRecord := filepath.Join(opencodeData, "opencode", "storage", "message", "p1", "s1.json")
 	if err := os.MkdirAll(filepath.Dir(openCodeRecord), 0o755); err != nil {
 		t.Fatal(err)
 	}

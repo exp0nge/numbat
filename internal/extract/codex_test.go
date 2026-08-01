@@ -136,6 +136,117 @@ func TestExtractCodexMapsAllShapes(t *testing.T) {
 	assertUniqueEventIDs(t, res.Events)
 }
 
+func TestExtractCodexPrefersUserMessageEvent(t *testing.T) {
+	body := strings.Join([]string{
+		`{"timestamp":"t0","type":"session_meta","payload":{"id":"thread-1","cwd":"/repo"}}`,
+		`{"timestamp":"t1","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>injected</environment_context>"}]}}`,
+		`{"timestamp":"t2","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"inspect the service"}]}}`,
+		`{"timestamp":"t3","type":"event_msg","payload":{"type":"user_message","message":"inspect the service"}}`,
+		`{"timestamp":"t4","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<subagent_notification>injected</subagent_notification>"}]}}`,
+	}, "\n")
+	acts := activityEvents(extractCodex(t, body).Events)
+	if len(acts) != 1 {
+		t.Fatalf("got %d activity events, want one user prompt:\n%s", len(acts), dumpEvents(acts))
+	}
+	prompt := acts[0]
+	if prompt.EventType != model.EventPromptUser || prompt.ContentPreview != "inspect the service" {
+		t.Fatalf("prompt = %+v", prompt)
+	}
+	if prompt.Timestamp != "t3" || prompt.Evidence.Line != 4 || prompt.Evidence.JSONPointer != "/payload/message" {
+		t.Errorf("canonical prompt provenance = %q line %d %q", prompt.Timestamp, prompt.Evidence.Line, prompt.Evidence.JSONPointer)
+	}
+}
+
+func TestExtractCodexPaginatedUserMessage(t *testing.T) {
+	body := strings.Join([]string{
+		`{"timestamp":"t0","type":"session_meta","payload":{"id":"thread-1","cwd":"/repo","history_mode":"paginated"}}`,
+		`{"timestamp":"t1","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"paginated prompt"}]}}`,
+		`{"timestamp":"t2","type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","id":"u1","content":[{"type":"text","text":"paginated"},{"type":"text","text":" "},{"type":"text","text":"prompt"}]}}}`,
+	}, "\n")
+	acts := activityEvents(extractCodex(t, body).Events)
+	if len(acts) != 1 || acts[0].EventType != model.EventPromptUser || acts[0].ContentPreview != "paginated prompt" {
+		t.Fatalf("paginated prompt =\n%s", dumpEvents(acts))
+	}
+	if acts[0].Evidence.Line != 3 || acts[0].Evidence.JSONPointer != "/payload/item/content" {
+		t.Errorf("paginated prompt provenance = line %d %q", acts[0].Evidence.Line, acts[0].Evidence.JSONPointer)
+	}
+}
+
+func TestExtractCodexNamespacedNativeNamesStayGeneric(t *testing.T) {
+	cases := []struct {
+		name   string
+		tool   string
+		call   string
+		output string
+	}{
+		{
+			name:   "exec command",
+			tool:   "exec_command",
+			call:   `{"timestamp":"t1","type":"response_item","payload":{"type":"function_call","namespace":"mcp__remote","name":"exec_command","call_id":"c","arguments":"{\"cmd\":\"id\"}"}}`,
+			output: `{"timestamp":"t2","type":"response_item","payload":{"type":"function_call_output","call_id":"c","output":"uid=1"}}`,
+		},
+		{
+			name:   "apply patch",
+			tool:   "apply_patch",
+			call:   `{"timestamp":"t1","type":"response_item","payload":{"type":"function_call","namespace":"mcp__remote","name":"apply_patch","call_id":"c","arguments":"{\"patch\":\"*** Begin Patch\\n*** Add File: x\\n+x\\n*** End Patch\"}"}}`,
+			output: `{"timestamp":"t2","type":"response_item","payload":{"type":"function_call_output","call_id":"c","output":"done"}}`,
+		},
+		{
+			name:   "read file",
+			tool:   "read_file",
+			call:   `{"timestamp":"t1","type":"response_item","payload":{"type":"function_call","namespace":"mcp__remote","name":"read_file","call_id":"c","arguments":"{\"path\":\"/etc/passwd\"}"}}`,
+			output: `{"timestamp":"t2","type":"response_item","payload":{"type":"function_call_output","call_id":"c","output":"body"}}`,
+		},
+		{
+			name:   "create file",
+			tool:   "create_file",
+			call:   `{"timestamp":"t1","type":"response_item","payload":{"type":"function_call","namespace":"mcp__remote","name":"create_file","call_id":"c","arguments":"{\"path\":\"/tmp/x\"}"}}`,
+			output: `{"timestamp":"t2","type":"response_item","payload":{"type":"function_call_output","call_id":"c","output":"done"}}`,
+		},
+		{
+			name:   "edit file",
+			tool:   "edit_file",
+			call:   `{"timestamp":"t1","type":"response_item","payload":{"type":"function_call","namespace":"mcp__remote","name":"edit_file","call_id":"c","arguments":"{\"path\":\"/tmp/x\"}"}}`,
+			output: `{"timestamp":"t2","type":"response_item","payload":{"type":"function_call_output","call_id":"c","output":"done"}}`,
+		},
+		{
+			name:   "code mode exec",
+			tool:   "exec",
+			call:   `{"timestamp":"t1","type":"response_item","payload":{"type":"custom_tool_call","namespace":"mcp__remote","name":"exec","call_id":"c","input":"await tools.exec_command({cmd: 'id'})"}}`,
+			output: `{"timestamp":"t2","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c","output":"uid=1"}}`,
+		},
+		{
+			name:   "custom apply patch",
+			tool:   "apply_patch",
+			call:   `{"timestamp":"t1","type":"response_item","payload":{"type":"custom_tool_call","namespace":"mcp__remote","name":"apply_patch","call_id":"c","input":"*** Begin Patch\\n*** Add File: x\\n+x\\n*** End Patch"}}`,
+			output: `{"timestamp":"t2","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c","output":"done"}}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := strings.Join([]string{
+				`{"timestamp":"t0","type":"session_meta","payload":{"id":"thread-1","cwd":"/repo"}}`,
+				tc.call,
+				tc.output,
+			}, "\n")
+			acts := activityEvents(extractCodex(t, body).Events)
+			if len(acts) != 2 {
+				t.Fatalf("got %d events, want call + result:\n%s", len(acts), dumpEvents(acts))
+			}
+			call, result := acts[0], acts[1]
+			if call.EventType != model.EventToolCall || call.ToolName != tc.tool || call.MCPServer != "remote" || call.MCPTool != tc.tool {
+				t.Errorf("call was specialized or lost namespace: %+v", call)
+			}
+			if call.Command != "" || call.FilePath != "" || call.DiffSHA256 != "" {
+				t.Errorf("generic MCP call carries fabricated native fields: %+v", call)
+			}
+			if result.EventType != model.EventToolResult || result.ToolCallID != "c" {
+				t.Errorf("result was promoted to a native result: %+v", result)
+			}
+		})
+	}
+}
+
 // The running project path is seeded by session_meta's cwd and updated by a
 // later turn_context; events emitted before and after the turn_context must
 // carry the corresponding directory.
@@ -168,16 +279,16 @@ func TestExtractCodexStampsProvenance(t *testing.T) {
 	if first.SessionID != "thread-1" {
 		t.Errorf("session_id = %q, want thread-1", first.SessionID)
 	}
-	if first.Timestamp != "2026-06-02T10:00:01Z" {
-		t.Errorf("timestamp = %q, want 2026-06-02T10:00:01Z", first.Timestamp)
+	if first.Timestamp != "2026-06-02T10:00:02Z" {
+		t.Errorf("timestamp = %q, want 2026-06-02T10:00:02Z", first.Timestamp)
 	}
 	ev := first.Evidence
-	// The user prompt is on line 2 of the fixture (line 1 is session_meta).
-	if ev.ArtifactType != artifactCodexRollout || ev.LocalPath != "/cases/rollout.jsonl" || ev.Line != 2 {
+	// The canonical user_message is on line 3 of the fixture.
+	if ev.ArtifactType != artifactCodexRollout || ev.LocalPath != "/cases/rollout.jsonl" || ev.Line != 3 {
 		t.Errorf("evidence = %+v", ev)
 	}
-	if ev.JSONPointer != "/payload/content" {
-		t.Errorf("json_pointer = %q, want /payload/content", ev.JSONPointer)
+	if ev.JSONPointer != "/payload/message" {
+		t.Errorf("json_pointer = %q, want /payload/message", ev.JSONPointer)
 	}
 	if len(ev.SHA256) != 64 {
 		t.Errorf("sha256 = %q, want 64 hex chars", ev.SHA256)
@@ -803,6 +914,45 @@ func TestExtractCodexMCPToolFailureBeforeOutput(t *testing.T) {
 	}
 }
 
+func TestExtractCodexMCPDeferredFailureIsSingleUse(t *testing.T) {
+	body := strings.Join([]string{
+		`{"timestamp":"t1","type":"response_item","payload":{"type":"custom_tool_call","name":"mcp__db__query","call_id":"same","input":"SELECT 1"}}`,
+		`{"timestamp":"t2","type":"event_msg","payload":{"type":"mcp_tool_call_end","call_id":"same","result":{"Err":"timeout"}}}`,
+		`{"timestamp":"t3","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"same","output":"first"}}`,
+		`{"timestamp":"t4","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"same","output":"duplicate"}}`,
+	}, "\n")
+	acts := activityEvents(extractCodex(t, body).Events)
+
+	var results []model.Event
+	for _, ev := range acts {
+		if ev.EventType == model.EventToolResult && ev.ToolCallID == "same" {
+			results = append(results, ev)
+		}
+	}
+	if len(results) != 2 {
+		t.Fatalf("got %d tool results, want 2:\n%s", len(results), dumpEvents(acts))
+	}
+	if !hasTag(results[0].Tags, model.TagToolError) || hasTag(results[1].Tags, model.TagToolError) {
+		t.Errorf("deferred failure leaked past its first result: %+v", results)
+	}
+}
+
+func TestExtractCodexNewCallClearsDeferredMCPFailure(t *testing.T) {
+	body := strings.Join([]string{
+		`{"timestamp":"t1","type":"response_item","payload":{"type":"custom_tool_call","name":"mcp__db__query","call_id":"same","input":"SELECT 1"}}`,
+		`{"timestamp":"t2","type":"event_msg","payload":{"type":"mcp_tool_call_end","call_id":"same","result":{"Err":"timeout"}}}`,
+		`{"timestamp":"t3","type":"response_item","payload":{"type":"function_call","name":"lookup","call_id":"same","arguments":"{}"}}`,
+		`{"timestamp":"t4","type":"response_item","payload":{"type":"function_call_output","call_id":"same","output":"clean"}}`,
+	}, "\n")
+	acts := activityEvents(extractCodex(t, body).Events)
+
+	for _, ev := range acts {
+		if ev.EventType == model.EventToolResult && ev.ToolCallID == "same" && hasTag(ev.Tags, model.TagToolError) {
+			t.Fatalf("new call inherited a stale MCP failure: %+v", ev)
+		}
+	}
+}
+
 // A generic custom_tool_call_output must not become a command.result merely
 // because its id collides with a direct shell call. Variant-specific state keeps
 // it as a tool.result carrying the same id.
@@ -1103,10 +1253,78 @@ func TestExtractCodexSessionLifecycle(t *testing.T) {
 func TestExtractCodexNoSessionMetaNoLifecycle(t *testing.T) {
 	line := `{"timestamp":"t","type":"response_item","payload":{"type":"message","role":"user","content":"hi"}}`
 	res := extractCodex(t, line)
+	acts := activityEvents(res.Events)
+	if len(acts) != 1 || acts[0].EventType != model.EventPromptUser || acts[0].ContentPreview != "hi" {
+		t.Fatalf("headerless prompt fallback =\n%s", dumpEvents(acts))
+	}
 	for _, ev := range res.Events {
 		if ev.EventType == model.EventSessionStart || ev.EventType == model.EventSessionEnd {
 			t.Errorf("session lifecycle emitted without a session_meta: %+v", ev)
 		}
+	}
+}
+
+func TestExtractCodexResponsePromptFallbacks(t *testing.T) {
+	tests := []struct {
+		name        string
+		lines       []string
+		wantPrompt  string
+		wantLine    int
+		wantPointer string
+	}{
+		{
+			name: "headerless fallback replaced by explicit prompt",
+			lines: []string{
+				`{"timestamp":"t1","type":"response_item","payload":{"type":"message","role":"user","content":"human prompt"}}`,
+				`{"timestamp":"t2","type":"event_msg","payload":{"type":"user_message","message":"human prompt"}}`,
+			},
+			wantPrompt:  "human prompt",
+			wantLine:    2,
+			wantPointer: "/payload/message",
+		},
+		{
+			name: "headered prompt retained at EOF",
+			lines: []string{
+				`{"timestamp":"t0","type":"session_meta","payload":{"id":"thread-1","cwd":"/repo"}}`,
+				`{"timestamp":"t1","type":"response_item","payload":{"type":"message","role":"user","content":"truncated prompt"}}`,
+			},
+			wantPrompt:  "truncated prompt",
+			wantLine:    2,
+			wantPointer: "/payload/content",
+		},
+		{
+			name: "paginated prompt retained after item start",
+			lines: []string{
+				`{"timestamp":"t0","type":"session_meta","payload":{"id":"thread-1","cwd":"/repo"}}`,
+				`{"timestamp":"t1","type":"response_item","payload":{"type":"message","role":"user","content":"truncated prompt"}}`,
+				`{"timestamp":"t2","type":"event_msg","payload":{"type":"item_started","item":{"type":"UserMessage","content":[{"type":"text","text":"truncated prompt"}]}}}`,
+			},
+			wantPrompt:  "truncated prompt",
+			wantLine:    2,
+			wantPointer: "/payload/content",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			acts := activityEvents(extractCodex(t, strings.Join(tc.lines, "\n")).Events)
+			if len(acts) != 1 || acts[0].EventType != model.EventPromptUser || acts[0].ContentPreview != tc.wantPrompt {
+				t.Fatalf("prompt fallback =\n%s", dumpEvents(acts))
+			}
+			if acts[0].Evidence.Line != tc.wantLine || acts[0].Evidence.JSONPointer != tc.wantPointer {
+				t.Errorf("prompt provenance = line %d %q", acts[0].Evidence.Line, acts[0].Evidence.JSONPointer)
+			}
+		})
+	}
+}
+
+func TestExtractCodexDoesNotFlushInjectedContext(t *testing.T) {
+	body := strings.Join([]string{
+		`{"timestamp":"t0","type":"session_meta","payload":{"id":"thread-1","cwd":"/repo"}}`,
+		`{"timestamp":"t1","type":"response_item","payload":{"type":"message","role":"user","content":"<environment_context>injected</environment_context>"}}`,
+		`{"timestamp":"t2","type":"world_state","payload":{"full":false}}`,
+	}, "\n")
+	if acts := activityEvents(extractCodex(t, body).Events); len(acts) != 0 {
+		t.Fatalf("injected context became a prompt:\n%s", dumpEvents(acts))
 	}
 }
 
@@ -1240,6 +1458,7 @@ func TestExtractCodexFirstSessionMetaWins(t *testing.T) {
 		`{"timestamp":"t","type":"session_meta","payload":{"id":"first","cwd":"/p"}}`,
 		`{"timestamp":"t","type":"session_meta","payload":{"id":"second","cwd":"/q"}}`,
 		`{"timestamp":"t","type":"response_item","payload":{"type":"message","role":"user","content":"hi"}}`,
+		`{"timestamp":"t","type":"event_msg","payload":{"type":"user_message","message":"hi"}}`,
 	}, "\n")
 	acts := activityEvents(extractCodex(t, body).Events)
 	if len(acts) != 1 {
@@ -1247,5 +1466,153 @@ func TestExtractCodexFirstSessionMetaWins(t *testing.T) {
 	}
 	if acts[0].SessionID != "first" {
 		t.Errorf("session_id = %q, want first (the first session_meta is canonical)", acts[0].SessionID)
+	}
+}
+
+func TestExtractCodexForkSkipsCopiedHistory(t *testing.T) {
+	const childID = "019f84fe-e5e1-7f80-8745-493ccff96186"
+	body := strings.Join([]string{
+		`{"timestamp":"t1","type":"session_meta","payload":{"id":"` + childID + `","forked_from_id":"019f620e-730d-76e2-8204-f108cfe2f082","cwd":"/child"}}`,
+		`{"timestamp":"t2","type":"turn_context","payload":{"cwd":"/parent"}}`,
+		`not json`,
+		`{"timestamp":"t4","type":"event_msg","payload":{"type":"task_started","turn_id":"019f84f6-8114-7cd3-8ac7-47ad22f4fba9"}}`,
+		`{"timestamp":"t5","type":"response_item","payload":{"type":"message","role":"user","content":"parent prompt"}}`,
+		`{"timestamp":"t6","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"parent","arguments":"{\"command\":\"echo parent\"}"}}`,
+		`{"timestamp":"t7","type":"event_msg","payload":{"type":"task_started","turn_id":"` + childID + `"}}`,
+		`{"timestamp":"t8","type":"response_item","payload":{"type":"message","role":"assistant","content":"parent answer"}}`,
+		`{"timestamp":"t9","type":"event_msg","payload":{"type":"task_started","turn_id":"019f84ff-90e1-7f12-9b81-ed81048178c1"}}`,
+		`{"timestamp":"t10","type":"turn_context","payload":{"cwd":"/child/live"}}`,
+		`{"timestamp":"t11","type":"response_item","payload":{"type":"message","role":"user","content":"child prompt"}}`,
+		`{"timestamp":"t12","type":"event_msg","payload":{"type":"user_message","message":"child prompt"}}`,
+		`{"timestamp":"t13","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"child","arguments":"{\"command\":\"echo child\"}"}}`,
+		`{"timestamp":"t14","type":"response_item","payload":{"type":"function_call_output","call_id":"child","output":"done"}}`,
+	}, "\n")
+	res := extractCodex(t, body)
+	acts := activityEvents(res.Events)
+	if len(acts) != 3 {
+		t.Fatalf("got %d activity events, want child prompt/command/result: %s", len(acts), dumpEvents(acts))
+	}
+	if acts[0].EventType != model.EventPromptUser || acts[0].ContentPreview != "child prompt" ||
+		acts[1].EventType != model.EventCommandExec || acts[1].Command != "echo child" ||
+		acts[2].EventType != model.EventCommandResult {
+		t.Fatalf("events = %s, copied parent activity was not excluded", dumpEvents(acts))
+	}
+	for _, ev := range acts {
+		if ev.SessionID != childID || ev.ProjectPath != "/child/live" {
+			t.Errorf("child event identity = session %q path %q", ev.SessionID, ev.ProjectPath)
+		}
+	}
+	if acts[0].Evidence.Line != 12 {
+		t.Errorf("first child event line = %d, want 12", acts[0].Evidence.Line)
+	}
+	if len(res.Diagnostics) != 1 || !strings.Contains(res.Diagnostics[0].Msg, "may be omitted") {
+		t.Errorf("diagnostics = %+v, want one bounded uncertainty warning", res.Diagnostics)
+	}
+}
+
+func TestExtractCodexForkWithoutChildTurnEmitsOnlyLifecycle(t *testing.T) {
+	body := strings.Join([]string{
+		`{"timestamp":"t1","type":"session_meta","payload":{"id":"019f84fe-e5e1-7f80-8745-493ccff96186","forked_from_id":"019f620e-730d-76e2-8204-f108cfe2f082","cwd":"/child"}}`,
+		`{"timestamp":"t2","type":"event_msg","payload":{"type":"task_started","turn_id":"019f84f6-8114-7cd3-8ac7-47ad22f4fba9"}}`,
+		`{"timestamp":"t3","type":"event_msg","payload":{"type":"task_started","turn_id":"ffffffff-ffff-4fff-bfff-ffffffffffff"}}`,
+		`{"timestamp":"t4","type":"response_item","payload":{"type":"message","role":"user","content":"copied"}}`,
+	}, "\n")
+	res := extractCodex(t, body)
+	if acts := activityEvents(res.Events); len(acts) != 0 {
+		t.Fatalf("copied history emitted activity: %s", dumpEvents(acts))
+	}
+	if len(res.Events) != 2 || res.Events[0].EventType != model.EventSessionStart ||
+		res.Events[1].EventType != model.EventSessionEnd || res.Events[1].Evidence.Line != 1 {
+		t.Fatalf("events = %s, want lifecycle bounded by child session_meta", dumpEvents(res.Events))
+	}
+	if len(res.Diagnostics) != 1 || !strings.Contains(res.Diagnostics[0].Msg, "orderable child task boundary") {
+		t.Errorf("diagnostics = %+v, want one legacy-boundary uncertainty warning", res.Diagnostics)
+	}
+}
+
+func TestExtractCodexForkIgnoresCopiedLegacyTaskID(t *testing.T) {
+	body := strings.Join([]string{
+		`{"timestamp":"t1","type":"session_meta","payload":{"id":"019f84fe-e5e1-7f80-8745-493ccff96186","forked_from_id":"019f620e-730d-76e2-8204-f108cfe2f082","cwd":"/child"}}`,
+		`{"timestamp":"t2","type":"event_msg","payload":{"type":"task_started","turn_id":"ffffffff-ffff-4fff-bfff-ffffffffffff"}}`,
+		`{"timestamp":"t3","type":"event_msg","payload":{"type":"task_started","turn_id":"019f84f6-8114-7cd3-8ac7-47ad22f4fba9"}}`,
+		`{"timestamp":"t4","type":"response_item","payload":{"type":"message","role":"user","content":"copied"}}`,
+		`{"timestamp":"t5","type":"event_msg","payload":{"type":"task_started","turn_id":"019f84ff-90e1-7f12-9b81-ed81048178c1"}}`,
+		`{"timestamp":"t6","type":"response_item","payload":{"type":"message","role":"user","content":"child"}}`,
+		`{"timestamp":"t7","type":"event_msg","payload":{"type":"user_message","message":"child"}}`,
+	}, "\n")
+	res := extractCodex(t, body)
+	acts := activityEvents(res.Events)
+	if len(acts) != 1 || acts[0].ContentPreview != "child" {
+		t.Fatalf("events = %s, copied legacy turn was not excluded", dumpEvents(acts))
+	}
+	if len(res.Diagnostics) != 0 {
+		t.Fatalf("copied legacy task ID produced diagnostics after an ordered child boundary: %+v", res.Diagnostics)
+	}
+}
+
+func TestExtractCodexForkWithLegacyIDFailsOpen(t *testing.T) {
+	body := strings.Join([]string{
+		`{"timestamp":"t1","type":"session_meta","payload":{"id":"legacy-child","forked_from_id":"legacy-parent","cwd":"/child"}}`,
+		`{"timestamp":"t2","type":"response_item","payload":{"type":"message","role":"user","content":"visible"}}`,
+		`{"timestamp":"t3","type":"event_msg","payload":{"type":"user_message","message":"visible"}}`,
+	}, "\n")
+	res := extractCodex(t, body)
+	acts := activityEvents(res.Events)
+	if len(acts) != 1 || acts[0].ContentPreview != "visible" {
+		t.Fatalf("legacy fork did not fail open: %s", dumpEvents(acts))
+	}
+	if len(res.Diagnostics) != 1 || !strings.Contains(res.Diagnostics[0].Msg, "replay filtering disabled") {
+		t.Fatalf("diagnostics = %+v, want one replay-filter warning", res.Diagnostics)
+	}
+}
+
+func TestExtractCodexForkUnreadableBoundaryWarns(t *testing.T) {
+	const meta = `{"timestamp":"t1","type":"session_meta","payload":{"id":"019f84fe-e5e1-7f80-8745-493ccff96186","forked_from_id":"019f620e-730d-76e2-8204-f108cfe2f082","cwd":"/child"}}`
+	const boundary = `{"timestamp":"t3","type":"event_msg","payload":{"type":"task_started","turn_id":"019f84ff-90e1-7f12-9b81-ed81048178c1"}}`
+	for _, tc := range []struct {
+		name string
+		row  string
+	}{
+		{name: "malformed", row: `{"type":"event_msg","payload":{"type":"task_started"`},
+		{name: "missing turn id", row: `{"type":"event_msg","payload":{"type":"task_started"}}`},
+		{name: "unrecognized UUID version", row: `{"type":"event_msg","payload":{"type":"task_started","turn_id":"ffffffff-ffff-ffff-bfff-ffffffffffff"}}`},
+		{name: "overlong", row: strings.Repeat("x", maxLineSize+1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := strings.Join([]string{
+				meta,
+				tc.row,
+				boundary,
+				`{"timestamp":"t4","type":"response_item","payload":{"type":"message","role":"user","content":"child"}}`,
+				`{"timestamp":"t5","type":"event_msg","payload":{"type":"user_message","message":"child"}}`,
+			}, "\n")
+			res, err := CodexExtractor{maxBytes: len(body) + 1}.Extract(strings.NewReader(body), Source{Path: "/cases/fork.jsonl"})
+			if err != nil {
+				t.Fatalf("Extract returned error: %v", err)
+			}
+			acts := activityEvents(res.Events)
+			if len(acts) != 1 || acts[0].ContentPreview != "child" {
+				t.Fatalf("activity after the recovered boundary = %s", dumpEvents(acts))
+			}
+			if len(res.Diagnostics) != 1 || !strings.Contains(res.Diagnostics[0].Msg, "may be omitted") {
+				t.Fatalf("diagnostics = %+v, want one bounded omission warning", res.Diagnostics)
+			}
+		})
+	}
+
+	body := strings.Join([]string{
+		meta,
+		`{"type":"event_msg","payload":{"type":"task_started"}}`,
+		`{"timestamp":"t3","type":"response_item","payload":{"type":"message","role":"user","content":"unproven"}}`,
+	}, "\n")
+	res, err := CodexExtractor{maxBytes: len(body) + 1}.Extract(strings.NewReader(body), Source{Path: "/cases/fork.jsonl"})
+	if err != nil {
+		t.Fatalf("Extract returned error: %v", err)
+	}
+	if acts := activityEvents(res.Events); len(acts) != 0 {
+		t.Fatalf("activity after an unproven boundary was emitted: %s", dumpEvents(acts))
+	}
+	if len(res.Diagnostics) != 1 || !strings.Contains(res.Diagnostics[0].Msg, "child activity may be omitted") {
+		t.Fatalf("EOF diagnostics = %+v, want one bounded omission warning", res.Diagnostics)
 	}
 }
