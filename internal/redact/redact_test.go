@@ -1,6 +1,7 @@
 package redact
 
 import (
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -92,13 +93,90 @@ func TestStringLeavesBenignText(t *testing.T) {
 func TestStringKnownFalseNegatives(t *testing.T) {
 	cases := []string{
 		"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", // bare AWS secret access key, no key= prefix
-		"postgres://user:p4ssw0rd@host:5432/db",    // DB-URL embedded password
-		"Authorization: Bearer abcdef123456",       // bearer token without a secret-looking key
 	}
 	for _, c := range cases {
 		if got := String(c); !strings.Contains(got, c) {
 			t.Fatalf("behavior changed (now masked) for known false negative %q -> %q", c, got)
 		}
+	}
+}
+
+func TestStringMasksURLUserinfo(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"postgres://user:p4ssw0rd@host:5432/db", "postgres://user:***@host:5432/db"},
+		{"redis://user:pa:ss@cache.example/0", "redis://user:***@cache.example/0"},
+		{"amqp://user:p@ss@broker.example/vhost", "amqp://user:***@broker.example/vhost"},
+		{"postgres://user:p!$&'()*+,;=ss@db.example/app", "postgres://user:***@db.example/app"},
+		{"postgres://user:secret@db.example:5432;ops@example.com", "postgres://user:***@db.example:5432;ops@example.com"},
+		{"redis://user:secret@cache.example:6379,admin@example.com", "redis://user:***@cache.example:6379,admin@example.com"},
+		{"postgres://user:secret@db.example:5432&owner@example.com", "postgres://user:***@db.example:5432&owner@example.com"},
+		{"https://user:secret@[2001:db8::1]/", "https://user:***@[2001:db8::1]/"},
+		{
+			"postgres://a:first@one.example/db redis://b:second@two.example/0",
+			"postgres://a:***@one.example/db redis://b:***@two.example/0",
+		},
+	}
+	for _, tt := range tests {
+		if got := String(tt.in); got != tt.want {
+			t.Errorf("String(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+		if got := String(tt.want); got != tt.want {
+			t.Errorf("String is not idempotent: %q -> %q", tt.want, got)
+		}
+	}
+}
+
+func TestStringURLUserinfoMaskRemainsParseable(t *testing.T) {
+	got := String("postgres://user:secret@db.example/app")
+	u, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("url.Parse(%q): %v", got, err)
+	}
+	if u.User == nil || u.Host != "db.example" {
+		t.Fatalf("parsed URL lost userinfo or host: %#v", u)
+	}
+}
+
+func TestStringPreservesURLWithoutUserinfo(t *testing.T) {
+	tests := []string{
+		"https://api.example:8443;user=ops@example.com",
+		"api.example,https://api.example:8443,ops@example.com",
+		"https://api.example:8443&user=ops@example.com",
+		"https://api.example:8443 then ops@example.com",
+		"https://[2001:db8::1]:8443/",
+	}
+	for _, in := range tests {
+		if got := String(in); got != in {
+			t.Errorf("String(%q) = %q", in, got)
+		}
+	}
+}
+
+func TestStringMasksAuthorizationCredentials(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"Authorization: Bearer abcdef123456", "Authorization: Bearer " + Mask},
+		{"Authorization: Bearer test", "Authorization: Bearer " + Mask},
+		{"authorization=basic dXNlcjpwYXNz", "authorization=basic " + Mask},
+		{`{"Authorization":"Bearer abcdef123456"}`, `{"Authorization":"Bearer ` + Mask + `"}`},
+		{`headers["Authorization"] = "Bearer abcdef123456"`, `headers["Authorization"] = "Bearer ` + Mask + `"`},
+		{"Proxy-Authorization: Basic dXNlcjpwYXNz", "Proxy-Authorization: Basic " + Mask},
+	}
+	for _, tt := range tests {
+		if got := String(tt.in); got != tt.want {
+			t.Errorf("String(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+		if got := String(tt.want); got != tt.want {
+			t.Errorf("String is not idempotent: %q -> %q", tt.want, got)
+		}
+	}
+	if got := String("Bearer abcdef123456"); got != "Bearer abcdef123456" {
+		t.Errorf("unanchored bearer text changed: %q", got)
 	}
 }
 
@@ -1303,6 +1381,14 @@ func FuzzString(f *testing.F) {
 		got := String(in) // must not panic
 		if strings.Contains(got, secret) {
 			t.Fatalf("secret survived redaction: %q -> %q", in, got)
+		}
+		for _, positioned := range []string{
+			prefix + " postgres://user:" + secret + "@db.example/app " + suffix,
+			prefix + "\nAuthorization: Bearer " + secret + "\n" + suffix,
+		} {
+			if got := String(positioned); strings.Contains(got, secret) {
+				t.Fatalf("positioned secret survived redaction: %q -> %q", positioned, got)
+			}
 		}
 		_ = String(prefix + suffix) // exercise arbitrary non-secret text for panics
 	})

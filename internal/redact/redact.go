@@ -6,6 +6,7 @@
 package redact
 
 import (
+	"net/url"
 	"regexp"
 	"strings"
 )
@@ -29,6 +30,16 @@ var tokenPatterns = []*regexp.Regexp{
 }
 
 const secretKeyTerm = `(?i:SECRET|TOKEN|PASSWORD|PASSWD|API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY)`
+
+var (
+	uriSchemePattern               = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://`)
+	authorizationCredentialPattern = regexp.MustCompile(
+		`(?i)(^|[^A-Za-z0-9_-])((?:proxy-)?authorization["']?\]?[ \t]*[:=][ \t]*["']?(?:basic|bearer)[ \t]+)([A-Za-z0-9._~+/\-]+=*)`,
+	)
+)
+
+// urlUserinfoMask is valid URL userinfo and cannot be mined as an email local part.
+const urlUserinfoMask = "***"
 
 // secretKey matches a secret-looking assignment key (env var, JSON field,
 // YAML key). Capture group 1 is the key text as written.
@@ -72,6 +83,8 @@ const maxCredentialQueryKeyLen = len("x-amz-security-token")
 // patterns are limited to non-URL spans to avoid masking benign query keys such
 // as id_token.
 func String(s string) string {
+	s = maskURLUserinfo(s)
+	s = maskAuthorizationCredentials(s)
 	s = maskCredentialValues(s)
 	var b strings.Builder
 	last := 0
@@ -86,6 +99,113 @@ func String(s string) string {
 		out = p.ReplaceAllString(out, Mask)
 	}
 	return out
+}
+
+func maskAuthorizationCredentials(s string) string {
+	return authorizationCredentialPattern.ReplaceAllString(s, "${1}${2}"+Mask)
+}
+
+func maskURLUserinfo(s string) string {
+	var b strings.Builder
+	last := 0
+	for _, loc := range uriSchemePattern.FindAllStringIndex(s, -1) {
+		authorityStart := loc[1]
+		if authorityStart < last {
+			continue
+		}
+		authorityEnd := uriAuthorityEnd(s, authorityStart)
+		passwordStart, passwordEnd, ok := uriPasswordSpan(s[authorityStart:authorityEnd])
+		if !ok {
+			continue
+		}
+		credentialStart := authorityStart + passwordStart
+		credentialEnd := authorityStart + passwordEnd
+		if credentialStart >= credentialEnd {
+			continue
+		}
+		b.WriteString(s[last:credentialStart])
+		b.WriteString(urlUserinfoMask)
+		last = credentialEnd
+	}
+	if last == 0 {
+		return s
+	}
+	b.WriteString(s[last:])
+	return b.String()
+}
+
+// uriPasswordSpan finds user:password only when an @ is followed by a valid
+// host. Choosing the first such @ preserves @ inside passwords without letting
+// a later email address steal the host from an earlier DSN.
+func uriPasswordSpan(authority string) (int, int, bool) {
+	for search := 0; search < len(authority); {
+		rel := strings.IndexByte(authority[search:], '@')
+		if rel < 0 {
+			return 0, 0, false
+		}
+		at := search + rel
+		hostEnd := at + 1
+		for hostEnd < len(authority) && !uriHostTerminator(authority[hostEnd]) {
+			hostEnd++
+		}
+		if validURIHost(authority[at+1 : hostEnd]) {
+			colon := strings.IndexByte(authority[:at], ':')
+			if colon < 0 || completeHostPortBeforeSeparator(authority[:at]) {
+				return 0, 0, false
+			}
+			return colon + 1, at, colon+1 < at
+		}
+		search = at + 1
+	}
+	return 0, 0, false
+}
+
+func uriHostTerminator(b byte) bool {
+	switch b {
+	case ',', ';', '&', '\'', '(', ')', '*', '+', '=':
+		return true
+	}
+	return uriAuthorityTerminator(b)
+}
+
+func validURIHost(hostport string) bool {
+	if hostport == "" || strings.ContainsRune(hostport, '@') {
+		return false
+	}
+	u, err := url.Parse("scheme://" + hostport)
+	return err == nil && u.User == nil && u.Host == hostport && u.Hostname() != ""
+}
+
+// completeHostPortBeforeSeparator recognizes "host:port;...@..." prose. The
+// dotted/IP host requirement avoids treating an ordinary user:digits password
+// as a completed network authority.
+func completeHostPortBeforeSeparator(beforeAt string) bool {
+	sep := strings.IndexAny(beforeAt, ",;&")
+	if sep < 0 {
+		return false
+	}
+	prefix := beforeAt[:sep]
+	u, err := url.Parse("scheme://" + prefix)
+	if err != nil || u.User != nil || u.Host != prefix || u.Hostname() == "" || u.Port() == "" {
+		return false
+	}
+	host := u.Hostname()
+	return strings.ContainsRune(host, '.') || strings.ContainsRune(host, ':')
+}
+
+func uriAuthorityEnd(s string, start int) int {
+	for start < len(s) && !uriAuthorityTerminator(s[start]) {
+		start++
+	}
+	return start
+}
+
+func uriAuthorityTerminator(b byte) bool {
+	switch b {
+	case '/', '?', '#', '"', '`', '<', '>', '\\', '{', '}', '|', '^':
+		return true
+	}
+	return b <= ' ' || b >= 0x7f
 }
 
 // urlPattern matches an http(s) URL substring inside arbitrary text. It is used

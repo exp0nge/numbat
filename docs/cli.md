@@ -246,9 +246,12 @@ numbat writes typed NDJSON streams. Each record carries a `record_type` (`event`
 `endpoint.device_id` for fleet joins.
 `enforcement` is hook-only; `scan_summary` is scan-only.
 
-Event and finding value fields are redacted before emission. Event/timeline
-output keeps a readable, redacted `project_path`; findings and indicators use
-`project_path_hash` / `sample_project_path_hash` for joins. On findings,
+Event and finding value fields are redacted before emission. This includes
+credential query parameters, URL userinfo passwords, Basic/Bearer authorization
+values, secret-like assignments, and self-identifying token formats.
+Event/timeline output keeps a readable, redacted `project_path`; findings and
+indicators use `project_path_hash` / `sample_project_path_hash` for joins. On
+findings,
 `redacted:true` means at least one emitted finding field was masked. File-backed
 evidence refs keep `local_path` so an investigator can reopen the source; live
 hook and OTLP refs may omit it because there is no source file.
