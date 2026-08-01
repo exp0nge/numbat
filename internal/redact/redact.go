@@ -146,7 +146,7 @@ func uriAuthorityEnd(s string, start int) int {
 
 func uriAuthorityTerminator(b byte) bool {
 	switch b {
-	case '/', '?', '#', '"', '\'', '`', '<', '>', '\\', '{', '}', '[', ']', '|', '^', ',', ';', '&', '(', ')':
+	case '/', '?', '#', '"', '`', '<', '>', '\\', '{', '}', '|', '^':
 		return true
 	}
 	return b <= ' ' || b >= 0x7f

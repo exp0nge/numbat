@@ -373,9 +373,11 @@ func TestIndicatorsUserinfoNotMinedAsIPOrHash(t *testing.T) {
 func TestIndicatorsDSNUserinfoNotMined(t *testing.T) {
 	hash := "0123456789abcdef0123456789abcdef"
 	events := []model.Event{
-		{EventType: model.EventCommandExec, Command: "connect postgres://8.8.8.8:secret@db.example/app", EventID: "e1"},
-		{EventType: model.EventCommandExec, Command: "connect redis://" + hash + ":secret@cache.example/0", EventID: "e2"},
+		{EventType: model.EventCommandExec, Command: "connect postgres://8.8.8.8:secret@db.example:5432/app", EventID: "e1"},
+		{EventType: model.EventCommandExec, Command: "connect redis://" + hash + ":secret@cache.example:6379/0", EventID: "e2"},
 		{EventType: model.EventCommandExec, Command: "connect postgres://user:secret@db.example/app then https://evil.example/x", EventID: "e3"},
+		{EventType: model.EventCommandExec, Command: "connect postgres://user:p!$&'()*+,;=ss@9.9.9.9/db", EventID: "e4"},
+		{EventType: model.EventCommandExec, Command: "connect redis://user:secret@[2001:4860:4860::8888]:6379/0", EventID: "e5"},
 	}
 	inds := Indicators(events)
 	if ind := findInd(inds, IndicatorIPv4, "8.8.8.8"); ind != nil {
@@ -391,6 +393,17 @@ func TestIndicatorsDSNUserinfoNotMined(t *testing.T) {
 	}
 	if findInd(inds, IndicatorDomain, "evil.example") == nil {
 		t.Errorf("indicator outside DSN was lost: %+v", inds)
+	}
+	for _, host := range []string{"db.example", "cache.example"} {
+		if findInd(inds, IndicatorDomain, host) == nil {
+			t.Errorf("DSN host %q was lost: %+v", host, inds)
+		}
+	}
+	if findInd(inds, IndicatorIPv4, "9.9.9.9") == nil {
+		t.Errorf("DSN IPv4 host was lost: %+v", inds)
+	}
+	if findInd(inds, IndicatorIPv6, "2001:4860:4860::8888") == nil {
+		t.Errorf("DSN IPv6 host was lost: %+v", inds)
 	}
 }
 

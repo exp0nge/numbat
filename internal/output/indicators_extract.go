@@ -46,10 +46,11 @@ const maxExtractedIndicatorsPerField = 256
 // pipeline is captured without trailing pipe/redirect noise.
 var urlInText = regexp.MustCompile(`(?i:https?)://[^\s"'<>` + "`" + `|;)\\]+`)
 
-// uriAuthorityInText fences non-HTTP URI authorities from standalone miners.
-// Credentials and usernames inside a DSN are evidence, not independent IOCs.
+// uriAuthorityInText locates generic URI authorities. Their hosts are classified
+// directly; the full authority is then fenced from standalone miners so userinfo
+// cannot be reclassified as an indicator.
 var uriAuthorityInText = regexp.MustCompile(
-	`(?i:[a-z][a-z0-9+.-]*)://[A-Za-z0-9._~!$'*+%:@=-]+`,
+	`(?i:[a-z][a-z0-9+.-]*)://[A-Za-z0-9._~!$&'()*+,;=:%@\[\]-]+`,
 )
 
 // emailInText matches a conservative email address shape. The local part and
@@ -135,6 +136,20 @@ func extractIndicators(s string, markdown bool) ([]typedIndicator, bool) {
 		add(htyp, hval)
 	}
 
+	uriMatches := uriAuthorityInText.FindAllStringIndex(s, maxExtractedIndicatorsPerField+1)
+	if len(uriMatches) > maxExtractedIndicatorsPerField {
+		truncated = true
+	}
+	for _, loc := range uriMatches {
+		host, ok := nonHTTPURIHost(s[loc[0]:loc[1]])
+		if !ok {
+			continue
+		}
+		if typ, val := classifyHost(host); typ != "" {
+			add(typ, val)
+		}
+	}
+
 	// All non-URL miners run over a URL-blanked view of the text: bytes inside a
 	// URL authority (notably userinfo, user:pass@host) have already been decided
 	// by URL canonicalization and must never be reclassified as a standalone indicator.
@@ -177,6 +192,32 @@ func extractIndicators(s string, markdown bool) ([]typedIndicator, bool) {
 		}
 	}
 	return out, truncated
+}
+
+func nonHTTPURIHost(raw string) (string, bool) {
+	schemeEnd := strings.Index(raw, "://")
+	if schemeEnd <= 0 {
+		return "", false
+	}
+	scheme := raw[:schemeEnd]
+	if strings.EqualFold(scheme, "http") || strings.EqualFold(scheme, "https") {
+		return "", false
+	}
+	authority := raw[schemeEnd+3:]
+	if at := strings.LastIndexByte(authority, '@'); at >= 0 {
+		authority = authority[at+1:]
+	}
+	if strings.HasPrefix(authority, "[") {
+		end := strings.IndexByte(authority, ']')
+		if end <= 1 {
+			return "", false
+		}
+		return authority[1:end], true
+	}
+	if colon := strings.LastIndexByte(authority, ':'); colon >= 0 {
+		authority = authority[:colon]
+	}
+	return authority, authority != ""
 }
 
 // trimTrailingMarkdownEmphasis removes an exact closing bold marker from a
