@@ -678,6 +678,9 @@ func TestOpenClawCodexFlavorFunctionCall(t *testing.T) {
 	if result.EventType != model.EventCommandResult || result.ToolCallID != "c1" {
 		t.Errorf("result = %q/%q, want command.result/c1", result.EventType, result.ToolCallID)
 	}
+	if result.ContentPreview != "ok" {
+		t.Errorf("result preview = %q, want ok", result.ContentPreview)
+	}
 	if result.ExitCode != nil {
 		t.Errorf("codex command result must never fabricate an exit code, got %d", *result.ExitCode)
 	}
@@ -828,6 +831,45 @@ func TestOpenClawCodexResponseItemParity(t *testing.T) {
 			t.Errorf("json_pointer = %q, want /payload/arguments", ev.Evidence.JSONPointer)
 		}
 	})
+}
+
+func TestOpenClawEmbeddedCodexCodeModeParity(t *testing.T) {
+	input := `const r = await tools.exec_command({cmd:"git status", workdir:"/w"}); text(r.output);`
+	lines := []string{
+		`{"timestamp":"t","type":"session_meta","payload":{"id":"cx-code","cwd":"/w"}}`,
+		`{"timestamp":"t","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"code1","input":` + jsonString(input) + `}}`,
+		`{"timestamp":"t","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"code1","output":"clean"}}`,
+	}
+	res := extractOpenClaw(t, strings.Join(lines, "\n"))
+	if len(res.Events) != 2 {
+		t.Fatalf("got %d events, want command + result: %+v", len(res.Events), res.Events)
+	}
+	call, result := res.Events[0], res.Events[1]
+	if call.EventType != model.EventCommandExec || call.ToolName != codexToolExecCommand || call.Command != "git status" {
+		t.Errorf("call = %+v, want code-mode command.exec", call)
+	}
+	if result.EventType != model.EventCommandResult || result.ToolCallID != "code1" || result.ContentPreview != "clean" {
+		t.Errorf("result = %+v, want correlated command.result with preview", result)
+	}
+	assertOpenClawPointersResolve(t, res, lines)
+}
+
+func TestOpenClawEmbeddedCodexAmbiguousCodeModeStaysGeneric(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"t","type":"session_meta","payload":{"id":"cx-code","cwd":"/w"}}`,
+		`{"timestamp":"t","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"same","arguments":"{\"cmd\":\"true\"}"}}`,
+		`{"timestamp":"t","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"same","input":"const r = await tools.exec_command({cmd:\"id\"}); text(r.output);"}}`,
+		`{"timestamp":"t","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"same","input":"await tools.exec_command({cmd: dynamic})"}}`,
+		`{"timestamp":"t","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"same","output":"unknown"}}`,
+	}
+	res := extractOpenClaw(t, strings.Join(lines, "\n"))
+	if len(res.Events) != 4 {
+		t.Fatalf("got %d events, want 4: %+v", len(res.Events), res.Events)
+	}
+	if res.Events[2].EventType != model.EventToolCall || res.Events[3].EventType != model.EventToolResult {
+		t.Errorf("ambiguous custom call/result = %s/%s, want tool.call/tool.result", res.Events[2].EventType, res.Events[3].EventType)
+	}
+	assertOpenClawPointersResolve(t, res, lines)
 }
 
 // Regression: the OpenClaw embedded-Codex web_search_call must carry

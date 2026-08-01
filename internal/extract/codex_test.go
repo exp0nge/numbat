@@ -803,10 +803,9 @@ func TestExtractCodexMCPToolFailureBeforeOutput(t *testing.T) {
 	}
 }
 
-// A custom_tool_call_output (MCP/custom tools) is never a command.result even if
-// its call_id were to collide with a shell call: only function_call_output pairs
-// with a shell command.exec. The output must still surface — as a tool.result
-// carrying the same call_id — so a dropped event cannot pass this test vacuously.
+// A generic custom_tool_call_output must not become a command.result merely
+// because its id collides with a direct shell call. Variant-specific state keeps
+// it as a tool.result carrying the same id.
 func TestExtractCodexCustomToolOutputStaysToolResult(t *testing.T) {
 	body := strings.Join([]string{
 		`{"timestamp":"t1","type":"response_item","payload":{"type":"local_shell_call","call_id":"dup","status":"completed","action":{"type":"exec","command":["ls"]}}}`,

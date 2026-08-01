@@ -70,6 +70,10 @@ type codexState struct {
 	// the paired function_call_output is promoted from tool.result to
 	// command.result. A non-shell call's id never enters the set.
 	shellCallIDs map[string]struct{}
+	// codeModeShellCallIDs records custom exec cells that were safely reduced to
+	// one command.exec, so only their custom_tool_call_output becomes a
+	// command.result. Keeping the sets separate prevents cross-variant collisions.
+	codeModeShellCallIDs map[string]struct{}
 	// failedMCPCallIDs is the set of call_ids whose mcp_tool_call_end recorded a
 	// structured failure. A custom_tool_call_output emitted AFTER its end-event
 	// consults this so it still carries the tool-error signal regardless of the
@@ -110,6 +114,26 @@ func (st *codexState) noteShellCall(id string) {
 // isShellCall reports whether call_id was a recorded shell command.exec.
 func (st *codexState) isShellCall(id string) bool {
 	_, ok := st.shellCallIDs[id]
+	return ok
+}
+
+func (st *codexState) noteCodeModeShellCall(id string) {
+	if id == "" {
+		return
+	}
+	if st.codeModeShellCallIDs == nil {
+		st.codeModeShellCallIDs = map[string]struct{}{}
+	}
+	st.codeModeShellCallIDs[id] = struct{}{}
+}
+
+func (st *codexState) forgetCodeModeShellCall(id string) {
+	delete(st.codeModeShellCallIDs, id)
+}
+
+func (st *codexState) takeCodeModeShellCall(id string) bool {
+	_, ok := st.codeModeShellCallIDs[id]
+	delete(st.codeModeShellCallIDs, id)
 	return ok
 }
 
@@ -311,9 +335,26 @@ func (e CodexExtractor) mapResponseItem(res *Result, src Source, sha string, st 
 		st.noteShellCall(ri.CallID)
 		res.Events = append(res.Events, ev)
 	case codexRICustomToolCall:
+		// A later custom call reusing a malformed call id owns its next output.
+		st.forgetCodeModeShellCall(ri.CallID)
 		if ri.Name == codexToolApplyPatch {
 			e.emitApplyPatchCall(res, src, sha, st, line, ts, ri.Name, ri.CallID, string(ri.Input), "/payload/input")
 			return
+		}
+		if ri.Name == codexToolCodeModeExec {
+			if command, ok := codexCodeModeExecCommand(string(ri.Input)); ok {
+				ev := e.base(src, sha, st, line, ts, 0)
+				ev.Actor = model.ActorAssistant
+				ev.Confidence = model.ConfidenceHigh
+				ev.ToolName = codexToolExecCommand
+				ev.ToolCallID = ri.CallID
+				ev.EventType = model.EventCommandExec
+				ev.Command = command
+				ev.Evidence.JSONPointer = "/payload/input"
+				st.noteCodeModeShellCall(ri.CallID)
+				res.Events = append(res.Events, ev)
+				return
+			}
 		}
 		// A freeform/custom (often MCP-routed) tool call. The name is the only
 		// reliably structured field; the input is freeform text. Surface it as
@@ -350,9 +391,8 @@ func (e CodexExtractor) mapResponseItem(res *Result, src Source, sha string, st 
 		ev.ToolCallID = ri.CallID
 		ev.ContentPreview = preview(decodeCodexOutput(ri.Output))
 		ev.Evidence.JSONPointer = "/payload/output"
-		// A function_call_output paired by call_id with a prior shell command.exec
-		// is a command.result; a custom_tool_call_output (MCP/custom tools) or an
-		// output for a non-shell function_call stays tool.result.
+		// An output paired by call_id with the matching shell-call variant is a
+		// command.result. Other function/custom outputs stay tool.result.
 		//
 		// A shell command.result's ExitCode stays nil: Codex serializes a
 		// function_call_output as only its body (FunctionCallOutputPayload in
@@ -372,7 +412,8 @@ func (e CodexExtractor) mapResponseItem(res *Result, src Source, sha string, st 
 		// mapEventMsg stamps TagToolError on this tool.result when it records a
 		// failure. When the end-event already arrived (it preceded this output), the
 		// failure was recorded in state, so tag here too.
-		if ri.Type == codexRIFunctionCallOutput && st.isShellCall(ri.CallID) {
+		if (ri.Type == codexRIFunctionCallOutput && st.isShellCall(ri.CallID)) ||
+			(ri.Type == codexRICustomToolCallOut && st.takeCodeModeShellCall(ri.CallID)) {
 			ev.EventType = model.EventCommandResult
 		} else {
 			ev.EventType = model.EventToolResult

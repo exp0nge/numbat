@@ -119,17 +119,15 @@ func (e OpenClawExtractor) mapCodexResponseItem(res *Result, src Source, sha str
 		ev.Confidence = model.ConfidenceHigh
 		ev.ToolCallID = ri.CallID
 		ev.Evidence.JSONPointer = "/payload/output"
-		// A function_call_output paired by call_id with a prior shell command.exec
-		// is a command.result; any other output stays tool.result. A command
-		// result's stdout is NOT previewed (data minimization, matching the
-		// native path); a non-command tool result names what came back. NO exit
-		// code is emitted: Codex's function_call_output carries no structured exit
-		// field (see codex.go), so ExitCode stays nil — a documented gap.
-		if ri.Type == codexRIFunctionCallOutput && st.isCommandCall(ri.CallID) {
+		ev.ContentPreview = preview(decodeCodexOutput(ri.Output))
+		// An output paired with the matching shell-call variant is a
+		// command.result; every other output stays tool.result. No exit code is
+		// emitted because Codex does not persist one in these response items.
+		if (ri.Type == codexRIFunctionCallOutput && st.isCommandCall(ri.CallID)) ||
+			(ri.Type == codexRICustomToolCallOut && st.takeCodexCodeModeCommandCall(ri.CallID)) {
 			ev.EventType = model.EventCommandResult
 		} else {
 			ev.EventType = model.EventToolResult
-			ev.ContentPreview = preview(decodeCodexOutput(ri.Output))
 			// An mcp_tool_call_end may have recorded this call's failure before its
 			// output landed (out-of-order); carry the structured tool-error forward so
 			// the late output is not a false negative, matching codex.go.
@@ -158,6 +156,23 @@ func (e OpenClawExtractor) mapCodexResponseItem(res *Result, src Source, sha str
 		ev.Evidence.JSONPointer = "/payload/action"
 		res.appendEvent(st, ev, true)
 	case codexRICustomToolCall:
+		// A later custom call reusing a malformed call id owns its next output.
+		st.forgetCodexCodeModeCommandCall(ri.CallID)
+		if ri.Name == codexToolCodeModeExec {
+			if command, ok := codexCodeModeExecCommand(string(ri.Input)); ok {
+				ev := e.base(src, sha, st, line, 0)
+				ev.Actor = model.ActorAssistant
+				ev.Confidence = model.ConfidenceHigh
+				ev.ToolName = codexToolExecCommand
+				ev.ToolCallID = ri.CallID
+				ev.EventType = model.EventCommandExec
+				ev.Command = command
+				ev.Evidence.JSONPointer = "/payload/input"
+				st.noteCodexCodeModeCommandCall(ri.CallID)
+				res.appendEvent(st, ev, true)
+				return
+			}
+		}
 		// A freeform/custom (often MCP-routed) tool call. The name is the only
 		// reliably structured field; the input is previewed so a reviewer sees
 		// WHAT was requested. An MCP-qualified name splits into typed server/tool
