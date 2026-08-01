@@ -168,7 +168,7 @@ func TestBuildBundleShape(t *testing.T) {
 	if err := json.Unmarshal(b, &m); err != nil {
 		t.Fatal(err)
 	}
-	if m.CaseID != "case-1" || m.SchemaVersion != "0.2.0" || m.Tool != "numbat" || m.ToolVersion == "" {
+	if m.CaseID != "case-1" || m.SchemaVersion != "0.2.0" || m.Tool != "numbat" || m.ToolVersion == "" || m.EvidenceMode != "none" {
 		t.Fatalf("manifest = %+v", m)
 	}
 	if m.CreatedAt != "2026-06-10T12:00:00Z" {
@@ -614,16 +614,41 @@ func TestBuildMalformedLineWarnsAndContinues(t *testing.T) {
 	}
 }
 
+func TestBuildMalformedLineWarningsAreSummarizedPerSource(t *testing.T) {
+	evidence := ref("/a/t.jsonl", 1)
+	lines := make([]string, maxMalformedWarningsPerSource+5)
+	for i := range lines {
+		lines[i] = "not-json"
+	}
+	lines = append(lines,
+		finding(t, "fnd-a", "case-1", "2026-06-02T10:00:00Z", evidence),
+		event(t, "event-for-fnd-a", "2026-06-02T09:59:59Z", evidence),
+	)
+	opts := buildOpts(writeStream(t, lines...))
+	opts.Out = filepath.Join(t.TempDir(), "case.numbat")
+	res := mustBuild(t, opts)
+	if len(res.Warnings) != maxMalformedWarningsPerSource+1 {
+		t.Fatalf("warnings = %v", res.Warnings)
+	}
+	if got := res.Warnings[len(res.Warnings)-1]; !strings.Contains(got, "5 additional malformed records suppressed") {
+		t.Fatalf("summary warning = %q", got)
+	}
+}
+
 func TestResultWarningsAreBounded(t *testing.T) {
 	var res Result
 	for i := 0; i < maxResultWarnings+100; i++ {
 		res.warn(fmt.Sprintf("warning %d", i))
 	}
-	if len(res.Warnings) != maxResultWarnings {
-		t.Fatalf("warnings = %d, want cap %d", len(res.Warnings), maxResultWarnings)
+	if len(res.Warnings) != maxGeneralResultWarnings {
+		t.Fatalf("warnings = %d, want cap %d", len(res.Warnings), maxGeneralResultWarnings)
 	}
 	if got := res.Warnings[len(res.Warnings)-1]; got != "additional warnings suppressed" {
 		t.Fatalf("last warning = %q", got)
+	}
+	res.warnEvidence("evidence omitted")
+	if got := res.Warnings[len(res.Warnings)-1]; got != "evidence omitted" {
+		t.Fatalf("evidence warning was suppressed: %v", res.Warnings)
 	}
 }
 
@@ -823,8 +848,14 @@ func TestEvidenceRawCopy(t *testing.T) {
 			ev = &m.Files[i]
 		}
 	}
+	if m.EvidenceMode != "raw" {
+		t.Fatalf("evidence_mode = %q, want raw", m.EvidenceMode)
+	}
 	if ev == nil || ev.SourcePath != artifact || !strings.HasSuffix(ev.Path, "-session.jsonl") {
 		t.Fatalf("evidence manifest entry = %+v", ev)
+	}
+	if ev.SourceSHA256 != sha256StringHex(content) || ev.SHA256 != ev.SourceSHA256 {
+		t.Fatalf("raw evidence hashes = stored %q source %q", ev.SHA256, ev.SourceSHA256)
 	}
 	copied, err := os.ReadFile(filepath.Join(opts.Out, filepath.FromSlash(ev.Path)))
 	if err != nil {
@@ -838,17 +869,19 @@ func TestEvidenceRawCopy(t *testing.T) {
 	}
 }
 
-func TestEvidenceRawCopyWarnsOnHashDrift(t *testing.T) {
+func TestEvidenceCopyWarnsOnHashDrift(t *testing.T) {
 	artifact := filepath.Join(t.TempDir(), "session.jsonl")
-	if err := os.WriteFile(artifact, []byte("changed since the finding\n"), 0o600); err != nil {
+	if err := os.WriteFile(artifact, []byte(`{"text":"changed since the finding"}`+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	opts := buildOpts(evidenceStream(t, artifact, strings.Repeat("a", 64)))
-	opts.Out = filepath.Join(t.TempDir(), "case.numbat")
-	opts.Evidence = EvidenceRaw
-	res := mustBuild(t, opts)
-	if len(res.Warnings) != 1 || !strings.Contains(res.Warnings[0], "changed since the finding") {
-		t.Fatalf("warnings = %v, want a hash-drift warning", res.Warnings)
+	for _, mode := range []EvidenceMode{EvidenceRaw, EvidenceRedacted} {
+		opts := buildOpts(evidenceStream(t, artifact, strings.Repeat("a", 64)))
+		opts.Out = filepath.Join(t.TempDir(), "case.numbat")
+		opts.Evidence = mode
+		res := mustBuild(t, opts)
+		if len(res.Warnings) != 1 || !strings.Contains(res.Warnings[0], "changed since the finding") {
+			t.Fatalf("mode %d warnings = %v, want a hash-drift warning", mode, res.Warnings)
+		}
 	}
 }
 
@@ -878,7 +911,7 @@ func TestEvidenceRawCopyWarnsOnConflictingRecordedDigests(t *testing.T) {
 	if res.EvidenceFiles != 1 {
 		t.Fatalf("evidence files = %d, want 1", res.EvidenceFiles)
 	}
-	want := fmt.Sprintf("evidence %q: content changed since the finding (recorded sha256s [%s, %s], copied %s)", artifact, otherSHA, currentSHA, currentSHA)
+	want := fmt.Sprintf("evidence %q: content changed since the finding (recorded sha256s [%s, %s], source at copy time %s)", artifact, otherSHA, currentSHA, currentSHA)
 	if len(res.Warnings) != 1 || res.Warnings[0] != want {
 		t.Fatalf("warnings = %v, want %q", res.Warnings, want)
 	}
@@ -937,9 +970,10 @@ func TestEvidenceCopyRejectsSymlinkSources(t *testing.T) {
 }
 
 func TestEvidenceRedactedCopyMasksSecrets(t *testing.T) {
-	artifact := filepath.Join(t.TempDir(), "session.jsonl")
+	artifact := filepath.Join(t.TempDir(), "session.log")
 	secret := "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789"
-	if err := os.WriteFile(artifact, []byte("before\n"+secret+"\nafter\n"), 0o600); err != nil {
+	source := "before\n" + secret + "\nafter\n"
+	if err := os.WriteFile(artifact, []byte(source), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	opts := buildOpts(evidenceStream(t, artifact, ""))
@@ -947,7 +981,7 @@ func TestEvidenceRedactedCopyMasksSecrets(t *testing.T) {
 	opts.Evidence = EvidenceRedacted
 	mustBuild(t, opts)
 
-	matches, err := filepath.Glob(filepath.Join(opts.Out, "evidence", "*-session.jsonl"))
+	matches, err := filepath.Glob(filepath.Join(opts.Out, "evidence", "*-session.log"))
 	if err != nil || len(matches) != 1 {
 		t.Fatalf("evidence copies = %v (%v)", matches, err)
 	}
@@ -961,13 +995,33 @@ func TestEvidenceRedactedCopyMasksSecrets(t *testing.T) {
 	if !strings.Contains(string(copied), "before\n") || !strings.Contains(string(copied), "after\n") {
 		t.Fatalf("redacted copy lost benign lines: %q", copied)
 	}
+	var m Manifest
+	manifest, err := os.ReadFile(filepath.Join(opts.Out, manifestName))
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	if err := json.Unmarshal(manifest, &m); err != nil {
+		t.Fatalf("parse manifest: %v", err)
+	}
+	if m.EvidenceMode != "redacted" {
+		t.Fatalf("evidence_mode = %q, want redacted", m.EvidenceMode)
+	}
+	var evidence ManifestFile
+	for _, mf := range m.Files {
+		if strings.HasPrefix(mf.Path, "evidence/") {
+			evidence = mf
+		}
+	}
+	if evidence.SourceSHA256 != sha256StringHex(source) || evidence.SHA256 == evidence.SourceSHA256 {
+		t.Fatalf("redacted evidence hashes = stored %q source %q", evidence.SHA256, evidence.SourceSHA256)
+	}
 	if v, err := Verify(opts.Out); err != nil || !v.OK() {
 		t.Fatalf("redacted bundle must verify: %+v, %v", v, err)
 	}
 }
 
 func TestEvidenceRedactedCopyPreservesLineEndings(t *testing.T) {
-	artifact := filepath.Join(t.TempDir(), "session.jsonl")
+	artifact := filepath.Join(t.TempDir(), "session.log")
 	body := "one\r\nGITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789\r\ntwo"
 	if err := os.WriteFile(artifact, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
@@ -977,7 +1031,7 @@ func TestEvidenceRedactedCopyPreservesLineEndings(t *testing.T) {
 	opts.Evidence = EvidenceRedacted
 	mustBuild(t, opts)
 
-	matches, err := filepath.Glob(filepath.Join(opts.Out, "evidence", "*-session.jsonl"))
+	matches, err := filepath.Glob(filepath.Join(opts.Out, "evidence", "*-session.log"))
 	if err != nil || len(matches) != 1 {
 		t.Fatalf("evidence copies = %v (%v)", matches, err)
 	}
@@ -988,6 +1042,112 @@ func TestEvidenceRedactedCopyPreservesLineEndings(t *testing.T) {
 	want := "one\r\nGITHUB_TOKEN=[redacted]\r\ntwo"
 	if string(copied) != want {
 		t.Fatalf("redacted copy = %q, want %q", copied, want)
+	}
+}
+
+func TestEvidenceRedactedStructuredFilesStayValid(t *testing.T) {
+	tests := []struct {
+		name string
+		ext  string
+		body string
+	}{
+		{
+			name: "jsonl",
+			ext:  ".jsonl",
+			body: `{"type":"token_count","total_token_usage":{"input_tokens":42}}` + "\r\n" +
+				`{"api_key":"plain-secret","text":"GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789"}`,
+		},
+		{
+			name: "retained jsonl archive",
+			ext:  ".jsonl.deleted.2026-07-23T10-11-12Z",
+			body: `{"type":"message","api_key":"plain-secret"}` + "\n",
+		},
+		{
+			name: "json",
+			ext:  ".json",
+			body: "{\n  \"api_key\": \"plain-secret\",\n  \"count\": 7\n}\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			artifact := filepath.Join(t.TempDir(), "session"+tc.ext)
+			if err := os.WriteFile(artifact, []byte(tc.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			opts := buildOpts(evidenceStream(t, artifact, sha256StringHex(tc.body)))
+			opts.Out = filepath.Join(t.TempDir(), "case.numbat")
+			opts.Evidence = EvidenceRedacted
+			res := mustBuild(t, opts)
+			if res.EvidenceFiles != 1 || len(res.Warnings) != 0 {
+				t.Fatalf("result = %+v", res)
+			}
+
+			matches, err := filepath.Glob(filepath.Join(opts.Out, "evidence", "*-session"+tc.ext))
+			if err != nil || len(matches) != 1 {
+				t.Fatalf("evidence copies = %v (%v)", matches, err)
+			}
+			copied, err := os.ReadFile(matches[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(copied), "plain-secret") || strings.Contains(string(copied), "ghp_") {
+				t.Fatalf("redacted copy leaked a secret: %s", copied)
+			}
+			if tc.ext == ".json" {
+				if !json.Valid(copied) {
+					t.Fatalf("redacted JSON is invalid: %s", copied)
+				}
+			} else {
+				for _, line := range strings.Split(string(copied), "\r\n") {
+					if !json.Valid([]byte(line)) {
+						t.Fatalf("redacted JSONL line is invalid: %s", line)
+					}
+				}
+			}
+
+			if v, err := Verify(opts.Out); err != nil || !v.OK() {
+				t.Fatalf("bundle must verify: %+v, %v", v, err)
+			}
+		})
+	}
+}
+
+func TestEvidenceRedactedRejectsUnsafeStructuredInput(t *testing.T) {
+	tests := []struct {
+		name string
+		ext  string
+		body string
+		want string
+	}{
+		{"malformed JSONL", ".jsonl", `{"token":`, "cannot safely redact JSON"},
+		{"credential in JSON key", ".json", `{"ghp_abcdefghijklmnopqrstuvwxyz0123456789":"value"}`, "object key"},
+		{"compressed JSONL", ".jsonl.zst", "compressed", "does not support compressed input"},
+		{"compressed retained archive", ".jsonl.deleted.2026-07-23T10-11-12Z.gz", "compressed", "does not support compressed input"},
+		{"binary input", ".bin", "\x00\x01\x02\x03", "only supports UTF-8 plain text or JSON"},
+		{"late binary input", ".log", strings.Repeat("a", 600) + "\x00secret", "only supports UTF-8 plain text or JSON"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			artifact := filepath.Join(t.TempDir(), "session"+tc.ext)
+			if err := os.WriteFile(artifact, []byte(tc.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			opts := buildOpts(evidenceStream(t, artifact, ""))
+			opts.Out = filepath.Join(t.TempDir(), "case.numbat")
+			opts.Evidence = EvidenceRedacted
+			res := mustBuild(t, opts)
+			if res.EvidenceFiles != 0 || len(res.Warnings) != 1 || !strings.Contains(res.Warnings[0], tc.want) {
+				t.Fatalf("result = %+v", res)
+			}
+			if _, err := os.Lstat(filepath.Join(opts.Out, "evidence")); !os.IsNotExist(err) {
+				t.Fatal("failed structured copy left an evidence directory")
+			}
+			if v, err := Verify(opts.Out); err != nil || !v.OK() {
+				t.Fatalf("bundle must verify: %+v, %v", v, err)
+			}
+		})
 	}
 }
 

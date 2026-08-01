@@ -251,6 +251,38 @@ func TestVerifyRejectsInvalidManifestStructure(t *testing.T) {
 	}
 }
 
+func TestValidateManifestEvidenceMetadata(t *testing.T) {
+	digestA := strings.Repeat("a", 64)
+	digestB := strings.Repeat("b", 64)
+	base := func(mode string, evidence ManifestFile) Manifest {
+		files := []ManifestFile{{Path: "findings.ndjson"}, {Path: "events.ndjson"}}
+		if evidence.Path != "" {
+			files = append(files, evidence)
+		}
+		return Manifest{
+			SchemaVersion: "0.2.0", CaseID: "case-1", CreatedAt: "2026-06-10T12:00:00Z",
+			Tool: "numbat", ToolVersion: "test", EvidenceMode: mode, Files: files,
+		}
+	}
+	tests := []struct {
+		name string
+		m    Manifest
+		want string
+	}{
+		{"invalid mode", base("masked", ManifestFile{}), `invalid evidence_mode "masked"`},
+		{"none with evidence", base("none", ManifestFile{Path: "evidence/x", SHA256: digestA}), "evidence_mode none"},
+		{"raw missing source hash", base("raw", ManifestFile{Path: "evidence/x", SHA256: digestA, SourcePath: "/tmp/x"}), "empty source_sha256"},
+		{"raw transformed", base("raw", ManifestFile{Path: "evidence/x", SHA256: digestA, SourcePath: "/tmp/x", SourceSHA256: digestB}), "does not match sha256"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := strings.Join(validateManifest(tc.m), "\n"); !strings.Contains(got, tc.want) {
+				t.Fatalf("problems = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestVerifyRejectsUnknownManifestField(t *testing.T) {
 	dir := t.TempDir()
 	raw := `{"schema_version":"0.2.0","case_id":"c","created_at":"2026-06-10T12:00:00Z","tool":"numbat","tool_version":"test","files":[],"surprise":true}`
