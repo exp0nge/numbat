@@ -390,6 +390,8 @@ explicitly:
 - **Gemini CLI** — defaults to gRPC on `:4317`, which numbat does not serve. Set
   `otlpProtocol=http` (in `~/.gemini/settings.json` telemetry settings or via the
   CLI flags) and point the OTLP endpoint at numbat's `http://127.0.0.1:4318`.
+  Command, file, and network targets require `logPrompts=true`, which also
+  exports prompts, tool inputs, and model responses.
 - **Qwen Code** — enable telemetry, set `otlpProtocol` to `http`, and set
   `otlpLogsEndpoint` (or `QWEN_TELEMETRY_OTLP_LOGS_ENDPOINT`) to
   `http://127.0.0.1:4318/v1/logs`. Keep `logPrompts` disabled when prompt content

@@ -100,11 +100,6 @@ const (
 	attrStatus       = "status"
 	attrToolCallID   = "tool.call_id"
 
-	// attrOperation is Gemini's file_operation direction key (read/create/update);
-	// it is NOT the standard file.operation key, so the Gemini path resolves it
-	// explicitly rather than relying on classifyFile's tool-name fallback.
-	attrOperation = "operation"
-
 	// attrOutput is the Codex tool_result output snippet.
 	attrOutput    = "output"
 	attrArguments = "arguments"
@@ -119,9 +114,6 @@ const (
 	// object (matching internal/extract/gemini's run_shell_command / file tools).
 	argCommand  = "command"
 	argFilePath = "file_path"
-
-	attrPathAlt     = "path"
-	attrFilePathAlt = "file_path"
 )
 
 // classifyAgentAlias maps a Claude, Codex, Gemini, or OpenCode private record onto
@@ -218,9 +210,6 @@ func classifyAgentAlias(ev *model.Event, a *attrs, rec logRecord, name string) b
 	case geminiToolCall, qwenToolCall:
 		classifyGeminiToolCall(ev, a, rec)
 		return true
-
-	case geminiFileOperation, qwenFileOperation:
-		return classifyGeminiFileOperation(ev, a, rec)
 
 	case geminiAPIResponse, qwenAPIResponse:
 		ev.EventType = model.EventMessageAssistant
@@ -607,34 +596,6 @@ func classifyGeminiToolCall(ev *model.Event, a *attrs, rec logRecord) {
 	}
 }
 
-// classifyGeminiFileOperation maps gemini_cli.file_operation onto file.read or
-// file.write. The direction comes from Gemini's bare "operation" attribute
-// (read -> file.read; create/update -> file.write), which is NOT the standard
-// file.operation key classifyFile reads — so it is resolved here explicitly
-// rather than left to classifyFile's tool-name heuristic, which would
-// misclassify a write whose tool_name carries no write/edit/create token. The
-// file path is read from the standard/Gemini keys, falling back to function_args.
-func classifyGeminiFileOperation(ev *model.Event, a *attrs, rec logRecord) bool {
-	ev.ToolName = a.str(attrAliasToolName, attrGenAIToolName, attrToolName)
-	ev.FilePath = firstNonEmpty(
-		a.str(attrFilePath, attrFilePathAlt, attrPathAlt, attrCodePath),
-		geminiArgField(a, argFilePath),
-	)
-
-	switch strings.ToLower(strings.TrimSpace(a.str(attrOperation))) {
-	case "create", "update":
-		ev.EventType = model.EventFileWrite
-	case "read":
-		ev.EventType = model.EventFileRead
-	default:
-		return false
-	}
-	if errored(a, rec) {
-		ev.Tags = append(ev.Tags, model.TagToolError)
-	}
-	return true
-}
-
 func classifyGeminiPermissionMode(ev *model.Event, a *attrs) {
 	mode := a.str(attrClaudeToMode)
 	ev.EventType = model.EventConfigAgent
@@ -648,31 +609,6 @@ func classifyGeminiPermissionMode(ev *model.Event, a *attrs) {
 func geminiModeElevated(mode string) bool {
 	normalized := strings.NewReplacer("_", "", "-", "").Replace(strings.ToLower(strings.TrimSpace(mode)))
 	return normalized == "yolo" || normalized == "autoedit"
-}
-
-// geminiArgField pulls a top-level string field out of Gemini's function_args
-// attribute, which arrives as a JSON object encoded in a string AnyValue. It
-// returns "" when function_args is absent, not an object, or lacks a string at
-// key. This mirrors internal/extract/gemini's geminiArgString over the on-disk
-// args map; here the map is one JSON hop away inside an OTLP attribute.
-func geminiArgField(a *attrs, key string) string {
-	raw := a.str(attrFunctionArgs)
-	if raw == "" {
-		return ""
-	}
-	var m map[string]json.RawMessage
-	if json.Unmarshal([]byte(raw), &m) != nil {
-		return ""
-	}
-	v, ok := m[key]
-	if !ok {
-		return ""
-	}
-	var s string
-	if json.Unmarshal(v, &s) != nil {
-		return ""
-	}
-	return s
 }
 
 // isShellToolName reports whether a tool name denotes shell/command execution,
