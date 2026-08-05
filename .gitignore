@@ -5,3 +5,6 @@
 *.numbat/
 *.db
 coverage.out
+docs/superpowers/
+docs/plans/
+docs/progress/
