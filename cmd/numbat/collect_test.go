@@ -944,3 +944,51 @@ func postLiveOTLP(t *testing.T, addr string, body []byte) {
 		t.Fatalf("live POST status = %d, want 200", resp.StatusCode)
 	}
 }
+
+func TestCollect_MetricsAndTracesFlags(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var records, diags bytes.Buffer
+	cDisabled := newTestCollector(t, &records, &diags, emitSelection{events: true})
+	cDisabled.enableMetrics = false
+	cDisabled.enableTraces = false
+
+	var stderrDisabled syncBuf
+	go func() {
+		serveCollect(ctx, "127.0.0.1:0", cDisabled, &stderrDisabled)
+	}()
+
+	addrDisabled := waitForListening(t, &stderrDisabled)
+
+	resp, err := http.Get(fmt.Sprintf("http://%s/metrics", addrDisabled))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status for /metrics when disabled = %d, want 404", resp.StatusCode)
+	}
+
+	cEnabled := newTestCollector(t, &records, &diags, emitSelection{events: true})
+	cEnabled.enableMetrics = true
+	cEnabled.enableTraces = true
+
+	var stderrEnabled syncBuf
+	go func() {
+		serveCollect(ctx, "127.0.0.1:0", cEnabled, &stderrEnabled)
+	}()
+
+	addrEnabled := waitForListening(t, &stderrEnabled)
+
+	resp, err = http.Get(fmt.Sprintf("http://%s/metrics", addrEnabled))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status for /metrics when enabled = %d, want 200", resp.StatusCode)
+	}
+}
+
+

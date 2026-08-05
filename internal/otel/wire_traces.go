@@ -5,6 +5,12 @@ import (
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
+func RecordTracesPayload(b []byte) error {
+	_, err := decodeTracesRequest(b)
+	return err
+}
+
+
 type tracesData struct {
 	resourceSpans []resourceSpans
 }

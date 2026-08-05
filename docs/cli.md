@@ -360,12 +360,15 @@ IDs so receivers can deduplicate it.
 --case-id ID                 case identifier stamped on every emitted event and derived finding
 --emit KIND                  record kind to emit: findings, events, indicators,
                              or all (repeatable; default findings)
+--enable-metrics             enable OTLP/HTTP metrics at /v1/metrics and Prometheus exporter at /metrics
+--enable-traces              enable OTLP/HTTP traces at /v1/traces
 --output SINK                record sink: stdout, file, or http
                              (repeatable; default stdout; stdout cannot be combined)
 --output-file PATH           destination path (required when output includes file)
 --rules-dir DIR              operator rules to add or replace by id
                              (repeatable)
 --no-builtin-rules           load only --rules-dir rules
+
 ```
 
 The HTTP sink flags (`--http-url`, `--http-auth`, `--http-batch-size`,

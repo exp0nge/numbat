@@ -210,11 +210,12 @@ families, enforcement eligibility, and deferred surfaces.
 
 ## OTLP/HTTP collection
 
-`collect` receives OTLP/HTTP **logs** from Claude Code, Codex, Gemini CLI, Qwen
-Code, OpenCode, and compatible log exporters. It does not ingest OTLP traces or
-metrics, so trace-only exporters such as VS Code Copilot Chat and OpenHands
-observability should use hooks or a full OpenTelemetry collector. The `/v1/logs`
-endpoint and per-agent setup are documented in [cli.md](cli.md#collect).
+`collect` receives OTLP/HTTP **logs** at `/v1/logs` from Claude Code, Codex, Gemini CLI, Qwen
+Code, OpenCode, and compatible log exporters. When launched with `--enable-metrics`, it also
+ingests OTLP metrics at `/v1/metrics` and exposes a Prometheus-compatible `/metrics` scrape
+endpoint for Grafana dashboards. When launched with `--enable-traces`, it ingests OTLP traces at
+`/v1/traces`. The endpoint details and per-agent setups are documented in [cli.md](cli.md#collect).
+
 
 ## Delivering files off-host
 

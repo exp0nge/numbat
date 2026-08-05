@@ -2,8 +2,48 @@ package otel
 
 import (
 	"fmt"
+	"strings"
+
 	"google.golang.org/protobuf/encoding/protowire"
 )
+
+func RecordMetricsPayload(b []byte, ms *MetricStore) error {
+	data, err := decodeMetricsRequest(b)
+	if err != nil {
+		return err
+	}
+	if ms == nil {
+		return nil
+	}
+	for _, rm := range data.resourceMetrics {
+		resAttrs := make(map[string]string)
+		for _, kv := range rm.resource.attributes {
+			resAttrs[kv.key] = kv.value.stringValue
+		}
+		for _, sm := range rm.scopeMetrics {
+			for _, m := range sm.metrics {
+				for _, dp := range m.dataPoints {
+					labels := make(map[string]string)
+					for k, v := range resAttrs {
+						if k == "service.name" || k == "service.instance.id" || strings.HasPrefix(k, "codex.") || strings.HasPrefix(k, "gen_ai.") {
+							labels[k] = v
+						}
+					}
+					for _, kv := range dp.attributes {
+						labels[kv.key] = kv.value.stringValue
+					}
+					val := float64(dp.asInt)
+					if dp.asDouble != 0 {
+						val = dp.asDouble
+					}
+					ms.Record(m.name, labels, val)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 
 type metricsData struct {
 	resourceMetrics []resourceMetrics

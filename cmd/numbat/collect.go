@@ -72,7 +72,10 @@ func runCollect(args []string, stdout, stderr io.Writer) int {
 	httpTSHeader := fs.String("http-timestamp-header", output.DefaultTimestampHeader, "header carrying the signed timestamp")
 	httpAllowInsecure := fs.Bool("http-allow-insecure", false, "allow plain http to non-loopback hosts")
 	httpGzip := fs.Bool("http-gzip", false, "gzip the HTTP POST body")
+	enableMetrics := fs.Bool("enable-metrics", false, "enable OTLP/HTTP metrics ingestion at /v1/metrics and Prometheus exporter at /metrics")
+	enableTraces := fs.Bool("enable-traces", false, "enable OTLP/HTTP traces ingestion at /v1/traces")
 	var rf ruleFlags
+
 	rf.register(fs)
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: numbat collect [--addr 127.0.0.1:4318] [--emit KIND ...] [--output SINK ...] [--case-id ID] [--rules-dir DIR ...] [--no-builtin-rules]")
@@ -139,13 +142,16 @@ func runCollect(args []string, stdout, stderr io.Writer) int {
 	rid := runID()
 	em := output.NewWithSink(sink, stderr, rid)
 	rcv, err := newCollector(collectorConfig{
-		emit:      em,
-		runID:     rid,
-		caseID:    *caseID,
-		sel:       sel,
-		ruleDirs:  rf.dirs,
-		noBuiltin: rf.noBuiltin,
+		emit:          em,
+		runID:         rid,
+		caseID:        *caseID,
+		sel:           sel,
+		ruleDirs:      rf.dirs,
+		noBuiltin:     rf.noBuiltin,
+		enableMetrics: *enableMetrics,
+		enableTraces:  *enableTraces,
 	})
+
 	if err != nil {
 		fmt.Fprintf(stderr, "collect: %v\n", err)
 		_ = em.Close()
@@ -187,6 +193,14 @@ func serveCollect(ctx context.Context, addr string, rcv *collector, stderr io.Wr
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(otlpLogsPath, rcv.handleLogs)
+	if rcv != nil && rcv.enableMetrics {
+		mux.HandleFunc("/v1/metrics", rcv.handleMetrics)
+		mux.HandleFunc("/metrics", rcv.handlePrometheus)
+	}
+	if rcv != nil && rcv.enableTraces {
+		mux.HandleFunc("/v1/traces", rcv.handleTraces)
+	}
+
 	srv := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
@@ -250,12 +264,14 @@ func warnIfOffLoopback(addr string, stderr io.Writer) {
 
 // collectorConfig carries the resolved dependencies a collector needs.
 type collectorConfig struct {
-	emit      *output.Emitter
-	runID     string
-	caseID    string
-	sel       emitSelection
-	ruleDirs  multiFlag
-	noBuiltin bool
+	emit          *output.Emitter
+	runID         string
+	caseID        string
+	sel           emitSelection
+	ruleDirs      multiFlag
+	noBuiltin     bool
+	enableMetrics bool
+	enableTraces  bool
 }
 
 // collector holds the per-receiver state: the shared pipeline every record flows
@@ -274,6 +290,10 @@ type collector struct {
 	emittedCounts map[string]int
 	deliveryDown  bool
 
+	enableMetrics bool
+	enableTraces  bool
+	metricStore   *otel.MetricStore
+
 	processedN atomic.Int64
 	skippedN   atomic.Int64
 	decodedN   atomic.Int64
@@ -288,7 +308,16 @@ func newCollector(cfg collectorConfig) (*collector, error) {
 	if rid == "" {
 		rid = runID()
 	}
-	c := &collector{emit: cfg.emit, caseID: cfg.caseID, indicatorsSel: cfg.sel.indicators, runID: rid}
+	c := &collector{
+		emit:          cfg.emit,
+		caseID:        cfg.caseID,
+		indicatorsSel: cfg.sel.indicators,
+		runID:         rid,
+		enableMetrics: cfg.enableMetrics,
+		enableTraces:  cfg.enableTraces,
+		metricStore:   otel.NewMetricStore(),
+	}
+
 
 	var eng *rule.Engine
 	if cfg.sel.findings || len(cfg.ruleDirs) > 0 || cfg.noBuiltin {
@@ -527,3 +556,60 @@ func writeOTLPError(w http.ResponseWriter, status int, msg string) {
 	w.WriteHeader(status)
 	_, _ = w.Write(body)
 }
+
+func (c *collector) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeOTLPError(w, http.StatusMethodNotAllowed, "method not allowed: use POST")
+		return
+	}
+	if !isProtobufContentType(r.Header.Get("Content-Type")) {
+		writeOTLPError(w, http.StatusUnsupportedMediaType, "unsupported content-type: want "+contentTypeProtobuf)
+		return
+	}
+	body, status, msg := readOTLPBody(w, r)
+	if status != 0 {
+		writeOTLPError(w, status, msg)
+		return
+	}
+	if err := otel.RecordMetricsPayload(body, c.metricStore); err != nil {
+		writeOTLPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeOTLPSuccess(w)
+}
+
+func (c *collector) handlePrometheus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	if c.metricStore != nil {
+		fmt.Fprint(w, c.metricStore.RenderPrometheusText())
+	}
+}
+
+func (c *collector) handleTraces(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeOTLPError(w, http.StatusMethodNotAllowed, "method not allowed: use POST")
+		return
+	}
+	if !isProtobufContentType(r.Header.Get("Content-Type")) {
+		writeOTLPError(w, http.StatusUnsupportedMediaType, "unsupported content-type: want "+contentTypeProtobuf)
+		return
+	}
+	body, status, msg := readOTLPBody(w, r)
+	if status != 0 {
+		writeOTLPError(w, status, msg)
+		return
+	}
+	if err := otel.RecordTracesPayload(body); err != nil {
+		writeOTLPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeOTLPSuccess(w)
+}
+
