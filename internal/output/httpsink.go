@@ -16,6 +16,7 @@ import (
 	"compress/gzip"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -28,6 +29,8 @@ import (
 	"sync"
 	"time"
 )
+
+
 
 // Auth modes for the http sink. Secrets for bearer/hmac come from the
 // environment only (see cmd/numbat), never from a flag, and are never logged.
@@ -93,10 +96,14 @@ type HTTPConfig struct {
 	// signature is computed over the compressed (on-the-wire) bytes, so a
 	// receiver verifies the HMAC against the raw body, then decompresses.
 	Gzip bool
+	// CertFile and KeyFile supply client mTLS certificates for HTTPS connections.
+	CertFile string
+	KeyFile  string
 	// HTTPClient is used for the POST; tests inject a stub. Defaults to a
 	// client with Timeout.
 	HTTPClient *http.Client
 }
+
 
 // SinkStats reports best-effort delivery counters. RecordsSent counts NDJSON
 // lines acknowledged in 2xx batches. LastStatus is the most recent HTTP status
@@ -142,6 +149,32 @@ func NewHTTPSink(cfg HTTPConfig) (*HTTPSink, error) {
 		client = *cfg.HTTPClient
 	}
 	client.Timeout = cfg.Timeout
+
+	if cfg.CertFile != "" && cfg.KeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("http sink: load client certificate: %w", err)
+		}
+		var tr *http.Transport
+		if client.Transport != nil {
+			if t, ok := client.Transport.(*http.Transport); ok {
+				tr = t.Clone()
+			}
+		}
+		if tr == nil {
+			if t, ok := http.DefaultTransport.(*http.Transport); ok {
+				tr = t.Clone()
+			} else {
+				tr = &http.Transport{}
+			}
+		}
+		if tr.TLSClientConfig == nil {
+			tr.TLSClientConfig = &tls.Config{}
+		}
+		tr.TLSClientConfig.Certificates = append(tr.TLSClientConfig.Certificates, cert)
+		client.Transport = tr
+	}
+
 	// Never follow redirects: a 307/308 would otherwise replay the NDJSON body
 	// and its bearer/HMAC headers to a different origin.
 	client.CheckRedirect = func(*http.Request, []*http.Request) error {
@@ -154,6 +187,7 @@ func NewHTTPSink(cfg HTTPConfig) (*HTTPSink, error) {
 		retryInterval: defaultRetryInterval,
 	}, nil
 }
+
 
 func validateHTTPConfig(cfg *HTTPConfig) error {
 	if cfg.URL == "" {

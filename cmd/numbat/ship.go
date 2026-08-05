@@ -95,6 +95,9 @@ func runShip(args []string, stdout, stderr io.Writer) int {
 	httpTSHeader := fs.String("http-timestamp-header", output.DefaultTimestampHeader, "header carrying the signed timestamp")
 	httpAllowInsecure := fs.Bool("http-allow-insecure", false, "allow plain http to non-loopback hosts")
 	httpGzip := fs.Bool("http-gzip", false, "gzip the HTTP POST body")
+	httpCertFile := fs.String("http-cert-file", os.Getenv("NUMBAT_HTTP_CERT_FILE"), "client certificate file for mTLS HTTPS delivery")
+	httpKeyFile := fs.String("http-key-file", os.Getenv("NUMBAT_HTTP_KEY_FILE"), "client private key file for mTLS HTTPS delivery")
+
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: numbat ship --input-file PATH --http-url URL [--state-file PATH] [--poll DUR] [HTTP options]")
 		fmt.Fprintln(stderr, "\nTails an append-only numbat NDJSON file to an HTTP endpoint with a durable")
@@ -158,10 +161,13 @@ func runShip(args []string, stdout, stderr io.Writer) int {
 			httpAuth:      *httpAuth,
 			httpSigHeader: *httpSigHeader,
 			httpTSHeader:  *httpTSHeader,
+			httpCertFile:  *httpCertFile,
+			httpKeyFile:   *httpKeyFile,
 			allowInsecure: *httpAllowInsecure,
 			gzip:          *httpGzip,
 			httpFlagsSet:  httpFlagsSet,
 		}, stdout)
+
 	}
 	if s, err := factory(); err != nil {
 		fmt.Fprintf(stderr, "ship: %v\n", err)

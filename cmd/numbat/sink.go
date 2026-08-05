@@ -53,6 +53,8 @@ type sinkConfig struct {
 	httpAuth      string
 	httpSigHeader string
 	httpTSHeader  string
+	httpCertFile  string
+	httpKeyFile   string
 	allowInsecure bool
 	gzip          bool
 	// httpFlagsSet lists the names of http-only flags the operator actually
@@ -79,7 +81,10 @@ var httpOnlyFlags = map[string]bool{
 	"http-sig-header":       true,
 	"http-timestamp-header": true,
 	"http-allow-insecure":   true,
+	"http-cert-file":        true,
+	"http-key-file":         true,
 }
+
 
 // buildSink validates the output flag combination and constructs the records
 // sink. stdout (the default) wraps the provided writer without taking ownership
@@ -159,7 +164,10 @@ func buildSink(cfg sinkConfig, stdout io.Writer) (output.Sink, error) {
 			UserAgent:      model.ToolName + "/" + version.String(),
 			AllowInsecure:  cfg.allowInsecure,
 			Gzip:           cfg.gzip,
+			CertFile:       cfg.httpCertFile,
+			KeyFile:        cfg.httpKeyFile,
 		})
+
 		if err != nil {
 			return nil, err
 		}
